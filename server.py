@@ -533,9 +533,42 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def apply_env_password_reset():
+    """One-time password reset from env vars, for a leader locked out of a hosted instance.
+
+    Set RESET_ACCOUNT_EMAIL and RESET_ACCOUNT_PASSWORD, restart, sign in, then delete both.
+    """
+    email = os.environ.get("RESET_ACCOUNT_EMAIL", "").strip().lower()
+    password = os.environ.get("RESET_ACCOUNT_PASSWORD", "")
+    if not email and not password:
+        return
+    if not email or len(password) < 6:
+        print("Password reset skipped: set RESET_ACCOUNT_EMAIL and a RESET_ACCOUNT_PASSWORD "
+              "of at least 6 characters.")
+        return
+    conn = db()
+    try:
+        user = conn.execute("SELECT id, password_hash FROM users WHERE email = ?", (email,)).fetchone()
+        if not user:
+            print(f"Password reset skipped: no account with the email {email}.")
+        elif check_password(password, user["password_hash"]):
+            print(f"Password for {email} is already set from RESET_ACCOUNT_PASSWORD. "
+                  "Delete RESET_ACCOUNT_EMAIL and RESET_ACCOUNT_PASSWORD from your variables.")
+        else:
+            with conn:
+                conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                             (hash_password(password), user["id"]))
+                conn.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+            print(f"Password reset for {email}. Sign in, then delete RESET_ACCOUNT_EMAIL and "
+                  "RESET_ACCOUNT_PASSWORD from your variables.")
+    finally:
+        conn.close()
+
+
 def main():
     mimetypes.add_type("application/javascript", ".js")
     init_db()
+    apply_env_password_reset()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Team Tasks running at http://{HOST}:{PORT}  (database: {DB_PATH})")
     try:

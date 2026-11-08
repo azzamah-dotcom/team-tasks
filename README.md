@@ -63,6 +63,7 @@ Every `git push` to `main` redeploys automatically. Your data stays on the `/dat
   python reset_password.py
   ```
   It asks for the email and a new password (typing is hidden), and signs that account out everywhere.
+- **Team leaders, without a console:** in Railway's **Variables** tab add `RESET_ACCOUNT_EMAIL` (the account email) and `RESET_ACCOUNT_PASSWORD` (the new password), and deploy. After you sign in, **delete both variables**.
 
 ## Files
 
