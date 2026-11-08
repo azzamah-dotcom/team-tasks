@@ -363,7 +363,7 @@ function taskItem(t) {
 function renderTasks() {
   const list = visibleTasks();
   const empty = {
-    open: isLeader() ? "No open tasks. Assign one from the panel on the right." : "You're all caught up. No open tasks.",
+    open: isLeader() ? "No open tasks. Use “Assign a task” to add one." : "You're all caught up. No open tasks.",
     soon: "Nothing due in the next 24 hours.",
     overdue: "Nothing overdue. Nice work.",
     done: "No completed tasks yet.",

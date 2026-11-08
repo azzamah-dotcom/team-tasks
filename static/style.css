@@ -316,3 +316,13 @@ dialog h2 { margin: 0; }
   .task-actions { width: 100%; justify-content: flex-end; }
   .panel { padding: 14px; }
 }
+
+/* ---------- touch devices: no auto-zoom ---------- */
+/* iOS Safari zooms the page when a focused field's text is under 16px. */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+button, a, summary, label, input, select, textarea { touch-action: manipulation; } /* no double-tap zoom */
+@media (hover: none) and (pointer: coarse), (max-width: 900px) {
+  input, select, textarea,
+  .filters select,
+  .search input { font-size: 16px; }
+}
