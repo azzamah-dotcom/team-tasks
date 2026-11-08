@@ -29,7 +29,8 @@ SECURE_COOKIES = os.environ.get("SECURE_COOKIES") == "1"
 # When set, new team leaders must enter this code to sign up (recommended when hosted publicly).
 LEADER_SIGNUP_CODE = os.environ.get("LEADER_SIGNUP_CODE", "").strip()
 COOKIE = "tt_session"
-SESSION_DAYS = 14
+SESSION_DAYS = 400       # browsers cap cookie lifetime at about 400 days
+SESSION_RENEW_DAYS = 1   # renew the session at most once a day while it's in use
 PBKDF2_ITERATIONS = 200_000
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -481,10 +482,19 @@ class Handler(BaseHTTPRequestHandler):
     def current_user(self, conn):
         token = self.session_token()
         if token:
+            token_hash = hash_token(token)
             row = conn.execute(
-                "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id "
-                "WHERE s.token_hash = ? AND s.expires_at > ?", (hash_token(token), now_iso())).fetchone()
+                "SELECT u.*, s.expires_at AS session_expires FROM sessions s JOIN users u ON u.id = s.user_id "
+                "WHERE s.token_hash = ? AND s.expires_at > ?", (token_hash, now_iso())).fetchone()
             if row:
+                # Sliding session: whenever the app is used, push the expiry out again so
+                # people stay signed in until they choose "Sign out".
+                renew_after = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS - SESSION_RENEW_DAYS)
+                if row["session_expires"] < iso(renew_after):
+                    new_expiry = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+                    conn.execute("UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
+                                 (iso(new_expiry), token_hash))
+                    self.set_cookie(token, SESSION_DAYS * 86400)
                 return row
         raise ApiError(401, "Please sign in.")
 

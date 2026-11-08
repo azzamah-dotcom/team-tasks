@@ -6,6 +6,7 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+const APP_NAME = "Zain Team Tasks";
 const MIN = 6e4, HOUR = 36e5, DAY = 864e5;
 const SOON_WINDOW = DAY; // tasks due within 24h count as "due soon"
 
@@ -85,6 +86,7 @@ const state = {
   tasks: [],
   view: "open",
   memberFilter: "all",
+  query: "",
   authMode: "login",
   signupCodeRequired: false,
 };
@@ -94,11 +96,11 @@ const isLeader = () => state.me?.role === "leader";
 // ---------- sign in / sign up ----------
 function renderAuth() {
   const signup = state.authMode === "signup";
-  document.title = "Team Tasks";
+  document.title = APP_NAME;
   app.innerHTML = `
   <main class="auth">
     <div class="auth-card">
-      <div class="brand"><span class="logo" aria-hidden="true">✓</span> Team Tasks</div>
+      <div class="brand"><span class="logo" aria-hidden="true">✓</span> <span class="brand-name"><span class="brand-zain">Zain</span> Team Tasks</span></div>
       <p class="muted">${signup
         ? "Create a team leader account. You'll add your team members after you sign in."
         : "Sign in to see your tasks and deadlines."}</p>
@@ -139,7 +141,7 @@ function renderShell() {
   const leader = isLeader();
   app.innerHTML = `
   <header class="topbar">
-    <div class="brand"><span class="logo" aria-hidden="true">✓</span> Team Tasks</div>
+    <div class="brand"><span class="logo" aria-hidden="true">✓</span> <span class="brand-name"><span class="brand-zain">Zain</span> Team Tasks</span></div>
     <div class="who">
       <span class="who-name">${esc(state.me.name)}</span>
       <span class="chip">${leader ? "Team leader" : `Team of ${esc(state.me.leader_name || "your leader")}`}</span>
@@ -159,6 +161,13 @@ function renderShell() {
             ${leader ? `<select id="member-filter" aria-label="Filter by team member"></select>` : ""}
           </div>
         </div>
+        <div class="search">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4 4"/></svg>
+          <input id="task-search" type="search" placeholder="Search tasks${leader ? ", people" : ""} or details…  ( / )"
+            aria-label="Search tasks" autocomplete="off">
+          <button type="button" class="search-clear" data-action="clear-search" aria-label="Clear search" hidden>✕</button>
+        </div>
+        <p id="search-info" class="muted small search-info" hidden></p>
         <ul id="task-list" class="tasks"></ul>
       </section>
       ${leader ? `
@@ -198,6 +207,16 @@ function renderShell() {
       </dialog>` : ""}
     </div>
   </main>`;
+
+  const search = $("#task-search");
+  search.value = state.query;
+  search.addEventListener("input", () => {
+    state.query = search.value;
+    renderTasks();
+  });
+  search.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { search.value = ""; state.query = ""; renderTasks(); }
+  });
 
   if (leader) {
     $('[data-form="task-create"] [name="due_at"]').value = defaultDeadline();
@@ -245,7 +264,7 @@ function renderBanner(c) {
       <span>Reminder: ${parts.join(" and ")}.</span>
       <button type="button" class="btn small" data-action="view" data-view="${c.overdue ? "overdue" : "soon"}">Show</button>
     </div>` : "";
-  document.title = c.overdue + c.soon ? `(${c.overdue + c.soon}) Team Tasks` : "Team Tasks";
+  document.title = c.overdue + c.soon ? `(${c.overdue + c.soon}) ${APP_NAME}` : APP_NAME;
 }
 
 function renderNotifyPrompt() {
@@ -269,10 +288,30 @@ function renderViewTabs() {
       data-action="view" data-view="${v}">${label}</button>`).join("");
 }
 
+const norm = (s) => String(s ?? "").toLocaleLowerCase();
+const searchTerms = () => norm(state.query).split(/\s+/).filter(Boolean);
+
+function matchesSearch(t, terms) {
+  const haystack = norm(`${t.title} ${t.description} ${t.assignee_name} ${t.priority}`);
+  return terms.every((term) => haystack.includes(term));
+}
+
+// Escape text and wrap search matches in <mark>.
+function hl(text) {
+  const terms = searchTerms();
+  const raw = String(text ?? "");
+  if (!terms.length) return esc(raw);
+  const pattern = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "gi");
+  return raw.split(pattern).map((part, i) => (i % 2 ? `<mark>${esc(part)}</mark>` : esc(part))).join("");
+}
+
 function visibleTasks() {
+  const terms = searchTerms();
   return state.tasks
     .filter((t) => state.memberFilter === "all" || String(t.assignee_id) === state.memberFilter)
+    .filter((t) => !terms.length || matchesSearch(t, terms))
     .filter((t) => {
+      if (terms.length) return true; // a search looks through every status
       const s = taskState(t);
       switch (state.view) {
         case "open": return s !== "done";
@@ -304,12 +343,12 @@ function taskItem(t) {
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10.5l3.2 3.2L15 7"/></svg>
     </button>
     <div class="task-body">
-      <div class="task-title">${esc(t.title)}
+      <div class="task-title">${hl(t.title)}
         ${t.priority !== "normal" ? `<span class="prio ${t.priority}">${t.priority}</span>` : ""}
       </div>
-      ${t.description ? `<p class="task-desc">${esc(t.description)}</p>` : ""}
+      ${t.description ? `<p class="task-desc">${hl(t.description)}</p>` : ""}
       <div class="task-meta">
-        ${leader ? `<span class="person">${esc(forSelf ? "Me" : t.assignee_name)}</span>` : ""}
+        ${leader ? `<span class="person">${forSelf ? "Me" : hl(t.assignee_name)}</span>` : ""}
         <span class="due">${dueText}</span>
       </div>
     </div>
@@ -330,7 +369,16 @@ function renderTasks() {
     done: "No completed tasks yet.",
     all: "No tasks yet.",
   }[state.view];
-  $("#task-list").innerHTML = list.length ? list.map(taskItem).join("") : `<li class="empty">${empty}</li>`;
+  const searching = searchTerms().length > 0;
+  const info = $("#search-info");
+  info.hidden = !searching;
+  $(".search-clear").hidden = !searching;
+  $("#view-tabs").classList.toggle("dimmed", searching);
+  if (searching) {
+    info.textContent = `${list.length} ${list.length === 1 ? "task matches" : "tasks match"} “${state.query.trim()}” across all statuses`;
+  }
+  const emptyText = searching ? "No tasks match your search." : empty;
+  $("#task-list").innerHTML = list.length ? list.map(taskItem).join("") : `<li class="empty">${emptyText}</li>`;
 }
 
 function renderTeam() {
@@ -489,8 +537,15 @@ app.addEventListener("click", async (e) => {
         state.authMode = "login";
         renderAuth();
         break;
+      case "clear-search":
+        state.query = "";
+        $("#task-search").value = "";
+        renderTasks();
+        $("#task-search").focus();
+        break;
       case "view":
         state.view = el.dataset.view;
+        if (state.query) { state.query = ""; $("#task-search").value = ""; }
         renderData();
         break;
       case "enable-notify":
@@ -602,6 +657,15 @@ app.addEventListener("submit", async (e) => {
     if (form.isConnected) formError(form, err.message);
   } finally {
     if (btn.isConnected) btn.disabled = false;
+  }
+});
+
+// Press "/" anywhere (outside a text field) to jump to search.
+document.addEventListener("keydown", (e) => {
+  const typing = e.target.closest?.("input, textarea, select, [contenteditable]");
+  if (e.key === "/" && !typing && $("#task-search") && !$("dialog[open]")) {
+    e.preventDefault();
+    $("#task-search").focus();
   }
 });
 

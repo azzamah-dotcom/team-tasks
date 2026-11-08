@@ -1,10 +1,13 @@
-# Team Tasks
+# Zain Team Tasks
 
 A task tracker for team leaders and their team members, with deadline reminders.
 
 - **Team leaders** sign up, add their team members, assign tasks with a deadline and priority, edit or delete them, and see the whole team's progress.
 - **Team members** sign in with the details their leader gave them, see only their own tasks, and mark each one done or not done.
 - Each leader's team and tasks are private. Other leaders can't see them.
+- **Search:** find tasks by title, details or person (press `/` to jump to the search box). Search looks through every status, including done tasks.
+- **Stay signed in:** sign-ins last about a year and renew themselves while the app is used, so nobody is signed out unless they click **Sign out** (or their password is reset).
+- **Zain look:** colors come from the Zain Branding Kit 2026 (teal, navy, deep navy, magenta, yellow) and follow the device's light or dark mode.
 - **Reminders:** the app shows a banner and a counter for tasks due within 24 hours or overdue. Once a user turns on reminders, it also sends a desktop notification while the app is open. Data refreshes every minute.
 
 ## Run it
