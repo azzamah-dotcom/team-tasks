@@ -55,6 +55,15 @@ The repo includes a `Dockerfile` and `railway.json`, so Railway builds it with n
 
 Every `git push` to `main` redeploys automatically. Your data stays on the `/data` volume.
 
+## Forgot a password?
+
+- **Team members:** their team leader resets it from **My team → Reset password**.
+- **Team leaders:** run the reset tool where the database lives. On Railway, open the service's **Console** tab; locally, use this folder. Then run:
+  ```bash
+  python reset_password.py
+  ```
+  It asks for the email and a new password (typing is hidden), and signs that account out everywhere.
+
 ## Files
 
 - `server.py`: HTTP server, JSON API, SQLite storage, sign-in sessions

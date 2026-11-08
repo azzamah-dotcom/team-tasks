@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
     TEAM_TASKS_DB=/data/team_tasks.db
 
 WORKDIR /app
-COPY server.py ./
+COPY server.py reset_password.py ./
 COPY static ./static
 
 # /data must be a persistent volume, or the database is lost on every redeploy.
