@@ -91,7 +91,7 @@ const state = {
   signupCodeRequired: false,
 };
 const app = $("#app");
-const isLeader = () => state.me?.role === "leader";
+const isLeader = () => state.me?.role === "leader" || !!state.me?.can_lead; // sub-leaders lead a team too
 
 // ---------- sign in / sign up ----------
 function renderAuth() {
@@ -137,6 +137,13 @@ function taskFields() {
   <label>Details <span class="muted">(optional)</span><textarea name="description" rows="3" maxlength="2000"></textarea></label>`;
 }
 
+function roleLabel() {
+  const me = state.me;
+  if (me.role === "leader") return "Team leader";
+  if (me.can_lead) return `Team leader · reports to ${esc(me.leader_name || "your leader")}`;
+  return `Team of ${esc(me.leader_name || "your leader")}`;
+}
+
 function renderShell() {
   const leader = isLeader();
   app.innerHTML = `
@@ -144,7 +151,7 @@ function renderShell() {
     <div class="brand"><span class="logo" aria-hidden="true">✓</span> <span class="brand-name"><span class="brand-zain">Zain</span> Team Tasks</span></div>
     <div class="who">
       <span class="who-name">${esc(state.me.name)}</span>
-      <span class="chip">${leader ? "Team leader" : `Team of ${esc(state.me.leader_name || "your leader")}`}</span>
+      <span class="chip">${roleLabel()}</span>
       <button type="button" class="btn ghost" data-action="logout">Sign out</button>
     </div>
   </header>
@@ -202,6 +209,25 @@ function renderShell() {
           <div class="dialog-actions">
             <button type="button" class="btn ghost" data-action="close-dialog">Cancel</button>
             <button type="submit" class="btn primary">Save changes</button>
+          </div>
+        </form>
+      </dialog>
+      <dialog id="cascade-dialog">
+        <form data-form="cascade" class="stack">
+          <h2>Cascade to my team</h2>
+          <p class="muted small cascade-intro"></p>
+          <div class="cascade-head">
+            <span class="small"><strong>Who gets a copy?</strong></span>
+            <button type="button" class="btn ghost small" data-action="cascade-all">Select all</button>
+          </div>
+          <ul class="cascade-list"></ul>
+          <label>Deadline for your team
+            <input name="due_at" type="datetime-local" required>
+            <span class="muted small hint">Can be earlier than yours, not later.</span>
+          </label>
+          <div class="dialog-actions">
+            <button type="button" class="btn ghost" data-action="close-dialog">Cancel</button>
+            <button type="submit" class="btn primary">Send</button>
           </div>
         </form>
       </dialog>` : ""}
@@ -328,18 +354,48 @@ function visibleTasks() {
     });
 }
 
+function childStatus(c) {
+  if (c.status === "done") return "done";
+  return new Date(c.due_at) < Date.now() ? "overdue" : "open";
+}
+
+function cascadeProgress(t) {
+  const kids = t.children || [];
+  if (!kids.length) return "";
+  const done = kids.filter((c) => c.status === "done").length;
+  const pct = Math.round((done / kids.length) * 100);
+  return `
+      <div class="cascade-progress" aria-label="${done} of ${kids.length} cascaded copies done">
+        <div class="cp-top">
+          <span class="cp-label">⤵ Cascaded · <strong>${done} of ${kids.length} done</strong></span>
+          <span class="cp-bar"><span data-pct="${pct}"></span></span>
+        </div>
+        <div class="cp-people">${kids.map((c) => {
+          const cs = childStatus(c);
+          return `<span class="cp-person ${cs}" title="${cs === "done" ? "Done" : cs === "overdue" ? "Overdue" : "Open"}">${cs === "done" ? "✓" : cs === "overdue" ? "!" : "•"} ${hl(c.assignee_name)}</span>`;
+        }).join("")}</div>
+      </div>`;
+}
+
 function taskItem(t) {
   const s = taskState(t);
   const leader = isLeader();
   const done = t.status === "done";
   const forSelf = t.assignee_id === state.me.id;
+  const mine = t.leader_id === state.me.id;              // I assigned it, so I can edit or delete it
+  const received = forSelf && !mine;                     // someone above me assigned it
+  const kids = t.children || [];
+  const auto = kids.length > 0;                           // completes by itself from its cascaded copies
+  const canCascade = received && leader && state.members.length > 0;
   const dueText = done
     ? `Done${t.done_at ? ` ${esc(fmtDate(t.done_at))}` : ""} · deadline was ${esc(fmtDate(t.due_at))}`
     : `Due ${esc(fmtDate(t.due_at))} · <strong>${relTime(t.due_at)}</strong>`;
+  const checkTitle = auto ? "Completes automatically when everyone it was cascaded to is done"
+    : done ? "Mark as not done" : "Mark as done";
   return `
   <li class="task ${s}" data-id="${t.id}">
-    <button type="button" class="check-btn ${done ? "checked" : ""}" data-action="toggle"
-      aria-label="${done ? "Mark as not done" : "Mark as done"}" title="${done ? "Mark as not done" : "Mark as done"}">
+    <button type="button" class="check-btn ${done ? "checked" : ""} ${auto ? "auto" : ""}" data-action="toggle"
+      aria-label="${checkTitle}" title="${checkTitle}" ${auto ? "disabled" : ""}>
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10.5l3.2 3.2L15 7"/></svg>
     </button>
     <div class="task-body">
@@ -348,14 +404,17 @@ function taskItem(t) {
       </div>
       ${t.description ? `<p class="task-desc">${hl(t.description)}</p>` : ""}
       <div class="task-meta">
-        ${leader ? `<span class="person">${forSelf ? "Me" : hl(t.assignee_name)}</span>` : ""}
+        ${received && leader ? `<span class="from">From ${hl(t.leader_name)}</span>` : ""}
+        ${leader && mine ? `<span class="person">${forSelf ? "Me" : hl(t.assignee_name)}</span>` : ""}
         <span class="due">${dueText}</span>
       </div>
+      ${cascadeProgress(t)}
     </div>
-    ${leader ? `
+    ${mine || canCascade ? `
     <div class="task-actions">
-      <button type="button" class="btn ghost small" data-action="edit">Edit</button>
-      <button type="button" class="btn ghost small danger" data-action="delete">Delete</button>
+      ${canCascade ? `<button type="button" class="btn small cascade-btn" data-action="cascade">⤵ ${auto ? "Cascade more" : "Cascade"}</button>` : ""}
+      ${mine ? `<button type="button" class="btn ghost small" data-action="edit">Edit</button>
+      <button type="button" class="btn ghost small danger" data-action="delete">Delete</button>` : ""}
     </div>` : ""}
   </li>`;
 }
@@ -379,6 +438,8 @@ function renderTasks() {
   }
   const emptyText = searching ? "No tasks match your search." : empty;
   $("#task-list").innerHTML = list.length ? list.map(taskItem).join("") : `<li class="empty">${emptyText}</li>`;
+  // Inline style attributes are blocked by the page's security policy, so size the bars here.
+  for (const bar of $$(".cp-bar span[data-pct]")) bar.style.width = `${bar.dataset.pct}%`;
 }
 
 function renderTeam() {
@@ -386,7 +447,8 @@ function renderTeam() {
     <li data-member-id="${m.id}">
       <div class="avatar" aria-hidden="true">${esc(m.name.trim().charAt(0).toUpperCase())}</div>
       <div class="member-info">
-        <div class="member-name">${esc(m.name)}</div>
+        <div class="member-name">${esc(m.name)}
+          ${m.can_lead ? `<span class="lead-badge">Sub-leader${m.team_size ? ` · leads ${m.team_size}` : ""}</span>` : ""}</div>
         <div class="muted small">${esc(m.email)}</div>
         <div class="member-counts small">
           <span>${m.open_count} open</span>
@@ -395,6 +457,9 @@ function renderTeam() {
         </div>
       </div>
       <div class="member-actions">
+        <button type="button" class="btn ghost small" data-action="toggle-lead"
+          title="${m.can_lead ? "Stop them from leading their own team" : "Let them add their own team and cascade your tasks to it"}">
+          ${m.can_lead ? "Remove leader role" : "Make team leader"}</button>
         <button type="button" class="btn ghost small" data-action="reset-pw">Reset password</button>
         <button type="button" class="btn ghost small danger" data-action="remove-member">Remove</button>
       </div>
@@ -460,6 +525,10 @@ function checkReminders() {
 // ---------- loading ----------
 async function refresh() {
   try {
+    const { user } = await api("GET", "/api/me");
+    const wasLeader = isLeader();
+    state.me = user;
+    if (isLeader() !== wasLeader) renderShell(); // role changed since the page was drawn
     const [{ tasks }, members] = await Promise.all([
       api("GET", "/api/tasks"),
       isLeader() ? api("GET", "/api/members") : Promise.resolve(null),
@@ -513,6 +582,39 @@ function openEdit(task) {
   $(".form-error", form)?.remove();
   dialog.showModal();
 }
+
+function updateCascadeButton() {
+  const n = $$('#cascade-dialog input[name="member"]:checked:not(:disabled)').length;
+  const btn = $('#cascade-dialog [type="submit"]');
+  btn.textContent = n ? `Send to ${n} ${n === 1 ? "person" : "people"}` : "Send";
+  btn.disabled = n === 0;
+}
+
+function openCascade(task) {
+  const dialog = $("#cascade-dialog");
+  const form = $("form", dialog);
+  form.dataset.taskId = task.id;
+  const has = new Set((task.children || []).map((c) => c.assignee_id));
+  $(".cascade-intro", dialog).innerHTML =
+    `<strong>${esc(task.title)}</strong> from ${esc(task.leader_name)}, due ${esc(fmtDate(task.due_at))}. ` +
+    "Each person gets their own copy. Your task completes when all of them are done.";
+  $(".cascade-list", dialog).innerHTML = state.members.map((m) => `
+    <li><label class="check">
+      <input type="checkbox" name="member" value="${m.id}" ${has.has(m.id) ? "checked disabled" : ""}>
+      <span>${esc(m.name)}</span>
+      ${has.has(m.id) ? `<span class="muted small">already has it</span>` : ""}
+    </label></li>`).join("");
+  const due = form.elements.due_at;
+  due.value = toLocalInput(task.due_at);
+  due.max = toLocalInput(task.due_at);
+  $(".form-error", form)?.remove();
+  updateCascadeButton();
+  dialog.showModal();
+}
+
+app.addEventListener("change", (e) => {
+  if (e.target.matches('#cascade-dialog input[name="member"]')) updateCascadeButton();
+});
 
 app.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-action]");
@@ -575,8 +677,24 @@ app.addEventListener("click", async (e) => {
         }
         break;
       case "close-dialog":
-        $("#edit-dialog").close();
+        el.closest("dialog")?.close();
         break;
+      case "cascade":
+        if (task) openCascade(task);
+        break;
+      case "cascade-all":
+        for (const box of $$('#cascade-dialog input[name="member"]:not(:disabled)')) box.checked = true;
+        updateCascadeButton();
+        break;
+      case "toggle-lead": {
+        if (!member) return;
+        const makeLead = !member.can_lead;
+        if (makeLead && !confirm(`Make ${member.name} a team leader?\n\nThey'll be able to add their own team members and cascade the tasks you give them down to their team.`)) return;
+        await api("PATCH", `/api/members/${member.id}`, { can_lead: makeLead });
+        toast(makeLead ? `${member.name} can now lead a team` : `${member.name} is no longer a team leader`);
+        await refresh();
+        break;
+      }
       case "reset-pw": {
         if (!member) return;
         const pw = prompt(`New password for ${member.name} (at least 6 characters):`);
@@ -586,7 +704,8 @@ app.addEventListener("click", async (e) => {
         break;
       }
       case "remove-member":
-        if (member && confirm(`Remove ${member.name} from your team? Their account and all their tasks will be deleted.`)) {
+        if (member && confirm(`Remove ${member.name} from your team? Their account and all their tasks will be deleted.` +
+            (member.team_size ? `\n\n${member.name} leads ${member.team_size} ${member.team_size === 1 ? "person" : "people"}. Their whole team will be removed too.` : ""))) {
           await api("DELETE", `/api/members/${member.id}`);
           toast(`${member.name} removed`);
           await refresh();
@@ -641,6 +760,17 @@ app.addEventListener("submit", async (e) => {
         await api("PATCH", `/api/tasks/${id}`, { ...taskPayload(fd), status: form.elements.done.checked ? "done" : "open" });
         $("#edit-dialog").close();
         toast("Task updated");
+        await refresh();
+        break;
+      }
+      case "cascade": {
+        const ids = $$('input[name="member"]:checked:not(:disabled)', form).map((b) => Number(b.value));
+        const { created } = await api("POST", `/api/tasks/${form.dataset.taskId}/cascade`, {
+          assignee_ids: ids,
+          due_at: new Date(form.elements.due_at.value).toISOString(),
+        });
+        $("#cascade-dialog").close();
+        toast(`Cascaded to ${created} ${created === 1 ? "person" : "people"}`);
         await refresh();
         break;
       }

@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('leader', 'member')),
   leader_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  can_lead INTEGER NOT NULL DEFAULT 0,  -- a member who also leads their own team (sub-leader)
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -59,7 +60,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   due_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done')),
   done_at TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE  -- set when cascaded from a leader's task
 );
 CREATE INDEX IF NOT EXISTS idx_users_leader ON users(leader_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_leader ON tasks(leader_id);
@@ -148,7 +150,7 @@ def hash_token(token):
 
 def public_user(row, conn=None):
     user = {"id": row["id"], "name": row["name"], "email": row["email"],
-            "role": row["role"], "leader_id": row["leader_id"]}
+            "role": row["role"], "leader_id": row["leader_id"], "can_lead": can_lead(row)}
     if conn is not None and row["leader_id"]:
         leader = conn.execute("SELECT name FROM users WHERE id = ?", (row["leader_id"],)).fetchone()
         user["leader_name"] = leader["name"] if leader else None
@@ -162,11 +164,35 @@ def db():
     return conn
 
 
+MIGRATIONS = [
+    ("users", "can_lead", "ALTER TABLE users ADD COLUMN can_lead INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "parent_id", "ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE"),
+]
+
+
+def migrate(conn):
+    """Add columns that older databases don't have yet, after taking a backup copy."""
+    pending = [sql for table, column, sql in MIGRATIONS
+               if column not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}]
+    if pending:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_path = DB_PATH.with_name(f"{DB_PATH.stem}.backup-{stamp}{DB_PATH.suffix}")
+        backup = sqlite3.connect(backup_path)
+        conn.backup(backup)
+        backup.close()
+        print(f"Database backed up to {backup_path} before upgrading.")
+        for sql in pending:
+            conn.execute(sql)
+        conn.commit()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)")
+
+
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = db()
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    migrate(conn)
     conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_iso(),))
     conn.commit()
     conn.close()
@@ -229,9 +255,14 @@ def api_me(h, conn):
     return 200, {"user": public_user(h.current_user(conn), conn)}
 
 
+def can_lead(user):
+    """Top-level leaders and sub-leaders both manage a team."""
+    return user["role"] == "leader" or bool(user["can_lead"])
+
+
 def require_leader(h, conn):
     user = h.current_user(conn)
-    if user["role"] != "leader":
+    if not can_lead(user):
         raise ApiError(403, "Only team leaders can do this.")
     return user
 
@@ -247,7 +278,8 @@ def own_member(conn, leader, member_id):
 def api_members_list(h, conn):
     leader = require_leader(h, conn)
     rows = conn.execute("""
-        SELECT u.id, u.name, u.email,
+        SELECT u.id, u.name, u.email, u.can_lead,
+          (SELECT COUNT(*) FROM users sub WHERE sub.leader_id = u.id) AS team_size,
           SUM(CASE WHEN t.status = 'open' THEN 1 ELSE 0 END) AS open_count,
           SUM(CASE WHEN t.status = 'open' AND t.due_at < ? THEN 1 ELSE 0 END) AS overdue_count,
           SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS done_count
@@ -255,7 +287,7 @@ def api_members_list(h, conn):
         WHERE u.leader_id = ? AND u.role = 'member'
         GROUP BY u.id ORDER BY u.name COLLATE NOCASE
     """, (now_iso(), leader["id"])).fetchall()
-    members = [{**dict(r), "open_count": r["open_count"] or 0, "overdue_count": r["overdue_count"] or 0,
+    members = [{**dict(r), "can_lead": bool(r["can_lead"]), "open_count": r["open_count"] or 0, "overdue_count": r["overdue_count"] or 0,
                 "done_count": r["done_count"] or 0} for r in rows]
     return 200, {"members": members}
 
@@ -285,20 +317,65 @@ def api_members_update(h, conn, member_id):
         conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
                      (hash_password(valid_password(data)), member["id"]))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (member["id"],))
+    if "can_lead" in data:
+        make_lead = bool(data["can_lead"])
+        if not make_lead and conn.execute("SELECT 1 FROM users WHERE leader_id = ?", (member["id"],)).fetchone():
+            raise ApiError(409, f"{member['name']} still leads a team. They need to remove their team members first.")
+        conn.execute("UPDATE users SET can_lead = ? WHERE id = ?", (int(make_lead), member["id"]))
     return 200, {"ok": True}
 
 
 def api_members_delete(h, conn, member_id):
     leader = require_leader(h, conn)
     member = own_member(conn, leader, member_id)
-    conn.execute("DELETE FROM users WHERE id = ?", (member["id"],))  # cascades to tasks + sessions
+    # Tasks this member cascaded from someone else's task: re-check those parents once they're gone.
+    parents = [r["parent_id"] for r in conn.execute(
+        "SELECT DISTINCT parent_id FROM tasks WHERE parent_id IS NOT NULL AND (assignee_id = ? OR leader_id = ?)",
+        (member["id"], member["id"]))]
+    conn.execute("DELETE FROM users WHERE id = ?", (member["id"],))  # cascades to their team, tasks, sessions
+    for parent_id in parents:
+        refresh_parent(conn, parent_id)
     return 200, {"ok": True}
 
 
 TASK_SELECT = """
-    SELECT t.*, a.name AS assignee_name FROM tasks t
+    SELECT t.*, a.name AS assignee_name, l.name AS leader_name FROM tasks t
     JOIN users a ON a.id = t.assignee_id
+    JOIN users l ON l.id = t.leader_id
 """
+
+
+def refresh_parent(conn, parent_id):
+    """A cascaded (parent) task is done exactly when all of its cascaded copies are done.
+
+    Walks up the chain, so completing the last task at the bottom completes every level above.
+    """
+    while parent_id:
+        parent = conn.execute("SELECT id, status, parent_id FROM tasks WHERE id = ?", (parent_id,)).fetchone()
+        if not parent:
+            return
+        total, done = conn.execute(
+            "SELECT COUNT(*), SUM(status = 'done') FROM tasks WHERE parent_id = ?", (parent_id,)).fetchone()
+        if total:
+            status = "done" if done == total else "open"
+            if status != parent["status"]:
+                conn.execute("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?",
+                             (status, now_iso() if status == "done" else None, parent_id))
+        parent_id = parent["parent_id"]
+
+
+def with_children(conn, tasks):
+    """Attach each task's cascaded copies (who has it and whether it's done)."""
+    by_id = {t["id"]: {**dict(t), "children": []} for t in tasks}
+    if by_id:
+        marks = ",".join("?" * len(by_id))
+        rows = conn.execute(
+            f"SELECT c.id, c.parent_id, c.assignee_id, c.status, c.due_at, a.name AS assignee_name "
+            f"FROM tasks c JOIN users a ON a.id = c.assignee_id WHERE c.parent_id IN ({marks}) "
+            f"ORDER BY a.name COLLATE NOCASE", list(by_id)).fetchall()
+        for r in rows:
+            by_id[r["parent_id"]]["children"].append(dict(r))
+    return list(by_id.values())
 
 
 def check_assignee(conn, leader, value):
@@ -320,11 +397,10 @@ def check_priority(value):
 
 def api_tasks_list(h, conn):
     user = h.current_user(conn)
-    if user["role"] == "leader":
-        rows = conn.execute(TASK_SELECT + " WHERE t.leader_id = ? ORDER BY t.due_at", (user["id"],))
-    else:
-        rows = conn.execute(TASK_SELECT + " WHERE t.assignee_id = ? ORDER BY t.due_at", (user["id"],))
-    return 200, {"tasks": [dict(r) for r in rows.fetchall()]}
+    # Tasks I gave out plus tasks given to me (a sub-leader has both).
+    rows = conn.execute(TASK_SELECT + " WHERE t.leader_id = ? OR t.assignee_id = ? ORDER BY t.due_at",
+                        (user["id"], user["id"])).fetchall()
+    return 200, {"tasks": with_children(conn, rows)}
 
 
 def api_tasks_create(h, conn):
@@ -340,52 +416,111 @@ def api_tasks_create(h, conn):
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (leader["id"], assignee_id, title, description, priority, due_at, now_iso()))
     task = conn.execute(TASK_SELECT + " WHERE t.id = ?", (cur.lastrowid,)).fetchone()
-    return 201, {"task": dict(task)}
+    return 201, {"task": with_children(conn, [task])[0]}
 
 
 def api_tasks_update(h, conn, task_id):
     user = h.current_user(conn)
     task = conn.execute("SELECT * FROM tasks WHERE id = ?", (int(task_id),)).fetchone()
-    is_leader = task and user["role"] == "leader" and task["leader_id"] == user["id"]
+    is_creator = task and task["leader_id"] == user["id"]
     is_assignee = task and task["assignee_id"] == user["id"]
-    if not task or not (is_leader or is_assignee):
+    if not task or not (is_creator or is_assignee):
         raise ApiError(404, "Task not found.")
+    has_children = conn.execute("SELECT 1 FROM tasks WHERE parent_id = ?", (task["id"],)).fetchone() is not None
     data = h.read_json()
     updates = {}
 
     if "status" in data:
         if data["status"] not in ("open", "done"):
             raise ApiError(400, "Status must be open or done.")
-        updates["status"] = data["status"]
-        updates["done_at"] = now_iso() if data["status"] == "done" else None
+        if data["status"] != task["status"]:
+            if has_children:
+                raise ApiError(409, "This task was cascaded to a team. It completes by itself when all of "
+                                    "their copies are done.")
+            updates["status"] = data["status"]
+            updates["done_at"] = now_iso() if data["status"] == "done" else None
 
-    leader_fields = {"title", "description", "assignee_id", "due_at", "priority"} & data.keys()
-    if leader_fields and not is_leader:
-        raise ApiError(403, "Only your team leader can change task details.")
+    detail_fields = {"title", "description", "assignee_id", "due_at", "priority"} & data.keys()
+    if detail_fields and not is_creator:
+        raise ApiError(403, "Only the person who assigned this task can change its details.")
     if "title" in data:
         updates["title"] = text(data, "title", max_len=140)
     if "description" in data:
         updates["description"] = text(data, "description", required=False, max_len=2000)
     if "assignee_id" in data:
-        updates["assignee_id"] = check_assignee(conn, user, data["assignee_id"])
+        assignee_id = check_assignee(conn, user, data["assignee_id"])
+        if assignee_id != task["assignee_id"] and has_children:
+            raise ApiError(409, "This task has already been cascaded to a team, so it can't be reassigned. "
+                                "Delete it and assign a new one instead.")
+        updates["assignee_id"] = assignee_id
     if "due_at" in data:
-        updates["due_at"] = parse_deadline(data["due_at"])
+        updates["due_at"] = check_child_deadline(conn, task["parent_id"], parse_deadline(data["due_at"]))
     if "priority" in data:
         updates["priority"] = check_priority(data["priority"])
 
     if updates:
         assignments = ", ".join(f"{col} = ?" for col in updates)
         conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", (*updates.values(), task["id"]))
+    if "status" in updates:
+        refresh_parent(conn, task["parent_id"])
     row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task["id"],)).fetchone()
-    return 200, {"task": dict(row)}
+    return 200, {"task": with_children(conn, [row])[0]}
+
+
+def check_child_deadline(conn, parent_id, due_at):
+    """A cascaded copy can't be due later than the task it came from."""
+    if parent_id:
+        parent = conn.execute("SELECT due_at FROM tasks WHERE id = ?", (parent_id,)).fetchone()
+        if parent and due_at > parent["due_at"]:
+            raise ApiError(400, "The deadline can't be later than the original task's deadline.")
+    return due_at
 
 
 def api_tasks_delete(h, conn, task_id):
-    leader = require_leader(h, conn)
-    cur = conn.execute("DELETE FROM tasks WHERE id = ? AND leader_id = ?", (int(task_id), leader["id"]))
-    if cur.rowcount == 0:
+    user = h.current_user(conn)
+    task = conn.execute("SELECT id, parent_id FROM tasks WHERE id = ? AND leader_id = ?",
+                        (int(task_id), user["id"])).fetchone()
+    if not task:
         raise ApiError(404, "Task not found.")
+    conn.execute("DELETE FROM tasks WHERE id = ?", (task["id"],))  # also deletes its cascaded copies
+    refresh_parent(conn, task["parent_id"])
     return 200, {"ok": True}
+
+
+def api_tasks_cascade(h, conn, task_id):
+    """A sub-leader passes a task they received down to chosen members of their own team."""
+    user = require_leader(h, conn)
+    task = conn.execute("SELECT * FROM tasks WHERE id = ? AND assignee_id = ?",
+                        (int(task_id), user["id"])).fetchone()
+    if not task:
+        raise ApiError(404, "Task not found.")
+    data = h.read_json()
+    ids = data.get("assignee_ids")
+    if not isinstance(ids, list) or not ids:
+        raise ApiError(400, "Choose at least one team member.")
+    due_at = task["due_at"]
+    if data.get("due_at"):
+        due_at = check_child_deadline(conn, task["id"], parse_deadline(data["due_at"]))
+    already = {r["assignee_id"] for r in conn.execute(
+        "SELECT assignee_id FROM tasks WHERE parent_id = ?", (task["id"],))}
+    created = 0
+    for raw_id in dict.fromkeys(ids):
+        try:
+            member = own_member(conn, user, int(raw_id))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Choose people from your own team.")
+        if member["id"] in already:
+            continue
+        conn.execute(
+            "INSERT INTO tasks (leader_id, assignee_id, title, description, priority, due_at, created_at, parent_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user["id"], member["id"], task["title"], task["description"], task["priority"], due_at,
+             now_iso(), task["id"]))
+        created += 1
+    refresh_parent(conn, task["id"])
+    row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task["id"],)).fetchone()
+    return 201, {"created": created, "skipped": len(dict.fromkeys(ids)) - created,
+                 "task": with_children(conn, [row])[0]}
 
 
 ROUTES = [
@@ -402,6 +537,7 @@ ROUTES = [
     ("POST", r"/api/tasks", api_tasks_create),
     ("PATCH", r"/api/tasks/(\d+)", api_tasks_update),
     ("DELETE", r"/api/tasks/(\d+)", api_tasks_delete),
+    ("POST", r"/api/tasks/(\d+)/cascade", api_tasks_cascade),
 ]
 
 

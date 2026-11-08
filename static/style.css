@@ -317,6 +317,56 @@ dialog h2 { margin: 0; }
   .panel { padding: 14px; }
 }
 
+/* ---------- cascading ---------- */
+.from {
+  background: var(--accent-soft); color: var(--accent); font-weight: 600;
+  padding: 2px 8px; border-radius: 99px;
+}
+@media (prefers-color-scheme: dark) { .from { color: var(--teal); } }
+.cascade-btn { border-color: var(--zain-teal); color: var(--teal); }
+.cascade-btn:hover { background: var(--teal-soft); }
+.check-btn.auto { cursor: default; border-style: dashed; }
+.check-btn.auto:hover { border-color: var(--border); }
+.check-btn.auto:hover svg { stroke: transparent; }
+.check-btn.auto.checked { border-style: solid; border-color: var(--ok); }
+.check-btn.auto.checked svg { stroke: #fff; }
+
+.cascade-progress {
+  margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+  background: var(--surface-2); display: flex; flex-direction: column; gap: 8px;
+}
+.cp-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+.cp-label { color: var(--muted); }
+.cp-label strong { color: var(--text); }
+.cp-bar { flex: 1; min-width: 80px; height: 6px; border-radius: 99px; background: var(--border); overflow: hidden; }
+.cp-bar span { display: block; height: 100%; border-radius: 99px; background: var(--brand-gradient); }
+.cp-people { display: flex; flex-wrap: wrap; gap: 6px; }
+.cp-person {
+  font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 99px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+}
+.cp-person.done { background: var(--ok-soft); border-color: transparent; color: var(--ok); }
+.cp-person.overdue { background: var(--bad-soft); border-color: transparent; color: var(--bad); }
+
+.lead-badge {
+  display: inline-block; margin-left: 6px; vertical-align: 1px;
+  font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 99px;
+  background: var(--brand-gradient); color: #fff;
+}
+.member-actions { flex-wrap: wrap; }
+
+.cascade-head { display: flex; justify-content: space-between; align-items: center; }
+.cascade-list {
+  list-style: none; margin: 0; padding: 4px 10px; max-height: 240px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 10px;
+}
+.cascade-list li { padding: 6px 0; border-bottom: 1px solid var(--border); }
+.cascade-list li:last-child { border-bottom: 0; }
+.cascade-list .check { gap: 10px; }
+.cascade-list .check .muted { margin-left: auto; font-weight: 500; }
+.cascade-intro { margin: 0; }
+.hint { display: block; font-weight: 500; margin-top: 4px; }
+
 /* ---------- touch devices: no auto-zoom ---------- */
 /* iOS Safari zooms the page when a focused field's text is under 16px. */
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }

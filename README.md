@@ -5,6 +5,7 @@ A task tracker for team leaders and their team members, with deadline reminders.
 - **Team leaders** sign up, add their team members, assign tasks with a deadline and priority, edit or delete them, and see the whole team's progress.
 - **Team members** sign in with the details their leader gave them, see only their own tasks, and mark each one done or not done.
 - Each leader's team and tasks are private. Other leaders can't see them.
+- **Sub-leaders and cascading:** in **My team**, click **Make team leader** on a member. They can then add their own team. When you give them a task, they click **Cascade** to send a copy to some or all of their people, optionally with an earlier deadline. Your task shows "2 of 5 done" with each person's status and completes by itself when every copy is done. This works through any number of levels (you → supervisors → staff → …).
 - **Search:** find tasks by title, details or person (press `/` to jump to the search box). Search looks through every status, including done tasks.
 - **Stay signed in:** sign-ins last about a year and renew themselves while the app is used, so nobody is signed out unless they click **Sign out** (or their password is reset).
 - **Zain look:** colors come from the Zain Branding Kit 2026 (teal, navy, deep navy, magenta, yellow) and follow the device's light or dark mode.
