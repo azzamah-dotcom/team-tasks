@@ -1,11 +1,12 @@
 # Zain Team Tasks
 
-A task tracker for team leaders and their team members, with deadline reminders.
+A task tracker for managers, their team leaders and team members, with deadline reminders.
 
-- **Team leaders** sign up, add their team members, assign tasks with a deadline and priority, edit or delete them, and see the whole team's progress.
+- **Managers** sign up (**New manager**) and add their team leaders. Everyone a manager adds is a **team leader** by default (untick "Team leader" for someone who only does tasks).
+- **Team leaders** add their own team members and assign tasks with a deadline and priority to themselves or their team, edit or delete them, and see their team's progress. Managers do the same with their team leaders.
 - **Team members** sign in with the details their leader gave them, see only their own tasks, and mark each one done or not done. They can also **edit** their tasks (title, details, priority, deadline). The leader sees "✎ Edited by …" on the task. Only the person who assigned a task can give it to someone else or delete it, and a cascaded copy can't be moved past the original deadline.
 - Each leader's team and tasks are private. Other leaders can't see them.
-- **Sub-leaders and cascading:** in **My team**, click **Make team leader** on a member. They can then add their own team. When you give them a task, they click **Cascade** to send a copy to some or all of their people, optionally with an earlier deadline. Your task shows "2 of 5 done" with each person's status and completes by itself when every copy is done. This works through any number of levels (you → supervisors → staff → …).
+- **Cascading:** in **My team**, click **Make team leader** on anyone who isn't one yet. They can then add their own team. When you give them a task, they click **Cascade** to send a copy to some or all of their people, optionally with an earlier deadline. Your task shows "2 of 5 done" with each person's status and completes by itself when every copy is done. This works through any number of levels (you → supervisors → staff → …).
 - **Gifts stock:** the **Gifts stock** tab keeps a private list of gifts and giveaways with photos and the quantity in each location (it starts with HQ Store, Yadaodeh Store, Marketing Store and Marketing Office, which you can rename or add to). In **Locations & people**, tick the team members who fill in each location; they only see the locations you give them and can add items, photos and counts, but not delete. Every quantity change is logged. **Share with manager** creates a read-only link (no sign-in needed) that you can replace or turn off any time. **⬇ Excel** downloads the list as a CSV.
 - **Search:** find tasks by title, details or person (press `/` to jump to the search box). Search looks through every status, including done tasks.
 - **Stay signed in:** sign-ins last about a year and renew themselves while the app is used, so nobody is signed out unless they click **Sign out** (or their password is reset).
@@ -21,7 +22,7 @@ cd team-tasks
 python3 server.py
 ```
 
-Open http://127.0.0.1:8000, choose **New team leader**, and create your account.
+Open http://127.0.0.1:8000, choose **New manager**, and create your account.
 
 ### Let your team use it on the same network
 
@@ -56,7 +57,7 @@ The repo includes a `Dockerfile` and `railway.json`, so Railway builds it with n
    - `LEADER_SIGNUP_CODE` set to a secret phrase you share only with team leaders
    - `PORT` set to `8000`
 5. **Get a public URL.** Under **Settings → Networking**, click **Generate Domain** (target port `8000`). Railway gives you an `https://….up.railway.app` address with HTTPS.
-6. Open the URL, choose **New team leader**, enter the invite code, and create your account. Share the URL with your team.
+6. Open the URL, choose **New manager**, enter the invite code, and create your account. Share the URL with your team.
 
 Every `git push` to `main` redeploys automatically. Your data stays on the `/data` volume.
 

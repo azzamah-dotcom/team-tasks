@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS users (
   can_lead INTEGER NOT NULL DEFAULT 0,  -- a member who also leads their own team (sub-leader)
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,  -- one-time data changes that have already run
+  value TEXT
+);
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -230,11 +234,22 @@ MIGRATIONS = [
 ]
 
 
+# One-time data changes, run once per database (recorded in app_meta).
+DATA_MIGRATIONS = [
+    # Managers' direct reports are team leaders: let all of them run their own team.
+    ("direct_reports_lead",
+     "UPDATE users SET can_lead = 1 WHERE role = 'member' "
+     "AND leader_id IN (SELECT id FROM users WHERE role = 'leader')"),
+]
+
+
 def migrate(conn):
-    """Add columns that older databases don't have yet, after taking a backup copy."""
+    """Add missing columns and run one-time data changes, after taking a backup copy."""
     pending = [sql for table, column, sql in MIGRATIONS
                if column not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}]
-    if pending:
+    done = {r["key"] for r in conn.execute("SELECT key FROM app_meta")}
+    data_pending = [(key, sql) for key, sql in DATA_MIGRATIONS if key not in done]
+    if pending or data_pending:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         backup_path = DB_PATH.with_name(f"{DB_PATH.stem}.backup-{stamp}{DB_PATH.suffix}")
         backup = sqlite3.connect(backup_path)
@@ -243,6 +258,10 @@ def migrate(conn):
         print(f"Database backed up to {backup_path} before upgrading.")
         for sql in pending:
             conn.execute(sql)
+        for key, sql in data_pending:
+            changed = conn.execute(sql).rowcount
+            conn.execute("INSERT INTO app_meta (key, value) VALUES (?, ?)", (key, now_iso()))
+            print(f"Upgrade '{key}': {changed} row(s) updated.")
         conn.commit()
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)")
 
@@ -365,11 +384,13 @@ def api_members_create(h, conn):
     password = valid_password(data)
     if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
         raise ApiError(409, "An account with this email already exists.")
+    # A manager's direct reports are team leaders unless the manager says otherwise.
+    lead = bool(data.get("can_lead", leader["role"] == "leader"))
     cur = conn.execute(
-        "INSERT INTO users (name, email, password_hash, role, leader_id, created_at) "
-        "VALUES (?, ?, ?, 'member', ?, ?)",
-        (name, email, hash_password(password), leader["id"], now_iso()))
-    return 201, {"member": {"id": cur.lastrowid, "name": name, "email": email}}
+        "INSERT INTO users (name, email, password_hash, role, leader_id, can_lead, created_at) "
+        "VALUES (?, ?, ?, 'member', ?, ?, ?)",
+        (name, email, hash_password(password), leader["id"], int(lead), now_iso()))
+    return 201, {"member": {"id": cur.lastrowid, "name": name, "email": email, "can_lead": lead}}
 
 
 def api_members_update(h, conn, member_id):

@@ -111,11 +111,11 @@ function renderAuth() {
     <div class="auth-card">
       <div class="brand"><span class="logo" aria-hidden="true">✓</span> <span class="brand-name"><span class="brand-zain">Zain</span> Team Tasks</span></div>
       <p class="muted">${signup
-        ? "Create a team leader account. You'll add your team members after you sign in."
+        ? "Create a manager account. You'll add your team leaders after you sign in."
         : "Sign in to see your tasks and deadlines."}</p>
       <div class="seg full" role="tablist">
         <button type="button" class="${signup ? "" : "active"}" data-action="auth-mode" data-mode="login">Sign in</button>
-        <button type="button" class="${signup ? "active" : ""}" data-action="auth-mode" data-mode="signup">New team leader</button>
+        <button type="button" class="${signup ? "active" : ""}" data-action="auth-mode" data-mode="signup">New manager</button>
       </div>
       <form data-form="${signup ? "signup" : "login"}" class="stack">
         ${signup && state.signupCodeRequired ? `<label>Invite code<input name="invite_code" required autocomplete="off"
@@ -126,7 +126,7 @@ function renderAuth() {
           autocomplete="${signup ? "new-password" : "current-password"}"></label>
         <button class="btn primary" type="submit">${signup ? "Create account" : "Sign in"}</button>
       </form>
-      ${signup ? "" : `<p class="muted small">Team member? Your team leader creates your account and gives you your sign-in details.</p>`}
+      ${signup ? "" : `<p class="muted small">Team leader or team member? The person you report to creates your account and gives you your sign-in details.</p>`}
     </div>
   </main>`;
   $("input", app)?.focus();
@@ -148,7 +148,7 @@ function taskFields() {
 
 function roleLabel() {
   const me = state.me;
-  if (me.role === "leader") return "Team leader";
+  if (me.role === "leader") return "Manager";
   if (me.can_lead) return `Team leader · reports to ${esc(me.leader_name || "your leader")}`;
   return `Team of ${esc(me.leader_name || "your leader")}`;
 }
@@ -215,11 +215,13 @@ function renderShell() {
           <h2>My team</h2>
           <ul id="team-list" class="team"></ul>
           <details class="add-member" id="add-member">
-            <summary>+ Add team member</summary>
+            <summary>+ Add ${state.me.role === "leader" ? "team leader" : "team member"}</summary>
             <form data-form="member-create" class="stack">
               <label>Name<input name="name" required maxlength="80"></label>
               <label>Email<input name="email" type="email" required autocomplete="off"></label>
               <label>Temporary password<input name="password" type="text" required minlength="6" autocomplete="off"></label>
+              <label class="check"><input type="checkbox" name="can_lead" ${state.me.role === "leader" ? "checked" : ""}>
+                Team leader (adds their own team and assigns tasks)</label>
               <button class="btn" type="submit">Add member</button>
               <p class="muted small">Share the email and password with them so they can sign in.</p>
             </form>
@@ -475,7 +477,7 @@ function renderTeam() {
       <div class="avatar" aria-hidden="true">${esc(m.name.trim().charAt(0).toUpperCase())}</div>
       <div class="member-info">
         <div class="member-name">${esc(m.name)}
-          ${m.can_lead ? `<span class="lead-badge">Sub-leader${m.team_size ? ` · leads ${m.team_size}` : ""}</span>` : ""}</div>
+          ${m.can_lead ? `<span class="lead-badge">Team leader${m.team_size ? ` · leads ${m.team_size}` : ""}</span>` : ""}</div>
         <div class="muted small">${esc(m.email)}</div>
         <div class="member-counts small">
           <span>${m.open_count} open</span>
@@ -734,7 +736,7 @@ app.addEventListener("click", async (e) => {
       case "toggle-lead": {
         if (!member) return;
         const makeLead = !member.can_lead;
-        if (makeLead && !confirm(`Make ${member.name} a team leader?\n\nThey'll be able to add their own team members and cascade the tasks you give them down to their team.`)) return;
+        if (makeLead && !confirm(`Make ${member.name} a team leader?\n\nThey'll be able to add their own team members, assign tasks to themselves and their team, and cascade the tasks you give them.`)) return;
         await api("PATCH", `/api/members/${member.id}`, { can_lead: makeLead });
         toast(makeLead ? `${member.name} can now lead a team` : `${member.name} is no longer a team leader`);
         await refresh();
@@ -823,9 +825,10 @@ app.addEventListener("submit", async (e) => {
         break;
       }
       case "member-create": {
+        fd.can_lead = form.elements.can_lead.checked;
         const { member } = await api("POST", "/api/members", fd);
         form.reset();
-        toast(`${member.name} added to your team`);
+        toast(`${member.name} added to your team${member.can_lead ? " as a team leader" : ""}`);
         await refresh();
         break;
       }
