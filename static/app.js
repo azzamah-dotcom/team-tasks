@@ -414,7 +414,7 @@ function taskItem(t) {
   const received = forSelf && !mine;                     // someone above me assigned it
   const kids = t.children || [];
   const auto = kids.length > 0;                           // completes by itself from its cascaded copies
-  const canCascade = received && leader && state.members.length > 0;
+  const canCascade = forSelf && leader;                  // any task on my plate can go down to my team
   const dueText = done
     ? `Done${t.done_at ? ` ${esc(fmtDate(t.done_at))}` : ""} · deadline was ${esc(fmtDate(t.due_at))}`
     : `Due ${esc(fmtDate(t.due_at))} · <strong>${relTime(t.due_at)}</strong>`;
@@ -632,12 +632,20 @@ function updateCascadeButton() {
 }
 
 function openCascade(task) {
+  if (!state.members.length) {
+    toast("Add people to your team first, then cascade this task to them.");
+    const add = $("#add-member");
+    add.open = true;
+    add.scrollIntoView({ behavior: "smooth", block: "center" });
+    $("input", add)?.focus();
+    return;
+  }
   const dialog = $("#cascade-dialog");
   const form = $("form", dialog);
   form.dataset.taskId = task.id;
   const has = new Set((task.children || []).map((c) => c.assignee_id));
   $(".cascade-intro", dialog).innerHTML =
-    `<strong>${esc(task.title)}</strong> from ${esc(task.leader_name)}, due ${esc(fmtDate(task.due_at))}. ` +
+    `<strong>${esc(task.title)}</strong>${task.leader_id === state.me.id ? "" : ` from ${esc(task.leader_name)}`}, due ${esc(fmtDate(task.due_at))}. ` +
     "Each person gets their own copy. Your task completes when all of them are done.";
   $(".cascade-list", dialog).innerHTML = state.members.map((m) => `
     <li><label class="check">
