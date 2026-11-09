@@ -161,14 +161,14 @@ async function bootShared(token) {
       stock.lists = [list];
       renderStock();
     } catch (err) {
-      app.innerHTML = `<main class="auth"><div class="auth-card"><div class="brand"><span class="logo" aria-hidden="true">✓</span>
-        <span class="brand-name"><span class="brand-zain">Zain</span> Gifts stock</span></div>
+      app.innerHTML = `<main class="auth"><div class="auth-card"><div class="brand">${ZAIN_LOGO}<span class="brand-sep" aria-hidden="true"></span>
+        <span class="brand-name">Gifts stock</span></div>
         <p>${esc(err.message)}</p></div></main>`;
     }
   };
   app.innerHTML = `
   <header class="topbar">
-    <div class="brand"><span class="logo" aria-hidden="true">✓</span> <span class="brand-name"><span class="brand-zain">Zain</span> Gifts stock</span></div>
+    <div class="brand">${ZAIN_LOGO}<span class="brand-sep" aria-hidden="true"></span><span class="brand-name">Gifts stock</span></div>
     <div class="who"><span class="chip">Read only</span></div>
   </header>` + stockMarkup(true);
   bindStockSearch();
