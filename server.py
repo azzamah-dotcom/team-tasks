@@ -4,6 +4,7 @@
 Zero dependencies: Python 3.9+ standard library only (http.server + sqlite3).
 Run:  python3 server.py      then open http://127.0.0.1:8000
 """
+import base64
 import hashlib
 import hmac
 import json
@@ -65,6 +66,61 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,  -- last person to change the details
   updated_at TEXT
 );
+-- Gifts & giveaways stock. Each team leader owns one private stock list.
+CREATE TABLE IF NOT EXISTS stock_locations (
+  id INTEGER PRIMARY KEY,
+  owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  sort INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+-- Team members the owner assigned to fill in a location's stock.
+CREATE TABLE IF NOT EXISTS stock_editors (
+  location_id INTEGER NOT NULL REFERENCES stock_locations(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  PRIMARY KEY (location_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS stock_items (
+  id INTEGER PRIMARY KEY,
+  owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'giveaway' CHECK (category IN ('gift', 'giveaway')),
+  notes TEXT NOT NULL DEFAULT '',
+  min_qty INTEGER NOT NULL DEFAULT 0,      -- flag as low stock at or below this total (0 = off)
+  photo BLOB,
+  photo_mime TEXT,
+  photo_version INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS stock_levels (
+  item_id INTEGER NOT NULL REFERENCES stock_items(id) ON DELETE CASCADE,
+  location_id INTEGER NOT NULL REFERENCES stock_locations(id) ON DELETE CASCADE,
+  qty INTEGER NOT NULL DEFAULT 0,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TEXT,
+  PRIMARY KEY (item_id, location_id)
+);
+CREATE TABLE IF NOT EXISTS stock_history (
+  id INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES stock_items(id) ON DELETE CASCADE,
+  location_id INTEGER NOT NULL REFERENCES stock_locations(id) ON DELETE CASCADE,
+  old_qty INTEGER NOT NULL,
+  new_qty INTEGER NOT NULL,
+  user_name TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+-- Read-only link the owner can give their manager.
+CREATE TABLE IF NOT EXISTS stock_shares (
+  owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stock_loc_owner ON stock_locations(owner_id);
+CREATE INDEX IF NOT EXISTS idx_stock_items_owner ON stock_items(owner_id);
+CREATE INDEX IF NOT EXISTS idx_stock_editors_user ON stock_editors(user_id);
+CREATE INDEX IF NOT EXISTS idx_stock_history_item ON stock_history(item_id);
 CREATE INDEX IF NOT EXISTS idx_users_leader ON users(leader_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_leader ON tasks(leader_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
@@ -256,7 +312,12 @@ def api_logout(h, conn):
 
 
 def api_me(h, conn):
-    return 200, {"user": public_user(h.current_user(conn), conn)}
+    user = h.current_user(conn)
+    payload = public_user(user, conn)
+    # Leaders keep a stock list; members see it only for the locations they were assigned to fill in.
+    payload["stock_access"] = can_lead(user) or conn.execute(
+        "SELECT 1 FROM stock_editors WHERE user_id = ?", (user["id"],)).fetchone() is not None
+    return 200, {"user": payload}
 
 
 def can_lead(user):
@@ -535,6 +596,329 @@ def api_tasks_cascade(h, conn, task_id):
                  "task": with_children(conn, [row])[0]}
 
 
+# ---------- gifts & giveaways stock ----------
+# Every team leader owns one private stock list. They choose which of their team members
+# fill in each location, and can hand their manager a read-only link.
+
+DEFAULT_LOCATIONS = ["HQ Store", "Yadaodeh Store", "Marketing Store", "Marketing Office"]
+CATEGORIES = ("gift", "giveaway")
+MAX_QTY = 1_000_000
+MAX_PHOTO_BYTES = 3_000_000
+PHOTO_TYPES = {b"\xff\xd8\xff": "image/jpeg", b"\x89PNG": "image/png", b"RIFF": "image/webp"}
+
+
+def stock_role(conn, user, owner_id):
+    """Returns (is_owner, ids of locations this user may edit). 404 if they have no access."""
+    owner_id = int(owner_id)
+    if owner_id == user["id"] and can_lead(user):
+        ids = {r["id"] for r in conn.execute("SELECT id FROM stock_locations WHERE owner_id = ?", (owner_id,))}
+        return True, ids
+    ids = {r["id"] for r in conn.execute(
+        "SELECT l.id FROM stock_editors e JOIN stock_locations l ON l.id = e.location_id "
+        "WHERE e.user_id = ? AND l.owner_id = ?", (user["id"], owner_id))}
+    if not ids:
+        raise ApiError(404, "Stock list not found.")
+    return False, ids
+
+
+def seed_locations(conn, owner_id):
+    has_any = conn.execute("SELECT 1 FROM stock_locations WHERE owner_id = ? UNION ALL "
+                           "SELECT 1 FROM stock_items WHERE owner_id = ? LIMIT 1", (owner_id, owner_id)).fetchone()
+    if not has_any:
+        for i, name in enumerate(DEFAULT_LOCATIONS):
+            conn.execute("INSERT INTO stock_locations (owner_id, name, sort, created_at) VALUES (?, ?, ?, ?)",
+                         (owner_id, name, i, now_iso()))
+
+
+def build_stock(conn, owner, visible_ids=None, is_owner=False):
+    """The stock list as JSON. visible_ids limits it to some locations (None = all)."""
+    locations = [dict(r) for r in conn.execute(
+        "SELECT id, name FROM stock_locations WHERE owner_id = ? ORDER BY sort, id", (owner["id"],))]
+    if visible_ids is not None:
+        locations = [l for l in locations if l["id"] in visible_ids]
+    shown = {l["id"] for l in locations}
+    if is_owner:
+        for loc in locations:
+            loc["editor_ids"] = [r["user_id"] for r in conn.execute(
+                "SELECT user_id FROM stock_editors WHERE location_id = ?", (loc["id"],))]
+    items = {}
+    for r in conn.execute("""
+        SELECT i.id, i.name, i.category, i.notes, i.min_qty, i.photo_version, i.created_at,
+               i.photo IS NOT NULL AS has_photo, i.updated_at, u.name AS updated_by_name
+        FROM stock_items i LEFT JOIN users u ON u.id = i.updated_by
+        WHERE i.owner_id = ? ORDER BY i.name COLLATE NOCASE""", (owner["id"],)):
+        items[r["id"]] = {**dict(r), "has_photo": bool(r["has_photo"]), "qty": {}}
+    for r in conn.execute("""
+        SELECT s.item_id, s.location_id, s.qty, s.updated_at, u.name AS updated_by_name
+        FROM stock_levels s JOIN stock_items i ON i.id = s.item_id LEFT JOIN users u ON u.id = s.updated_by
+        WHERE i.owner_id = ?""", (owner["id"],)):
+        item = items.get(r["item_id"])
+        if not item or r["location_id"] not in shown:
+            continue
+        item["qty"][str(r["location_id"])] = r["qty"]
+        # Show the most recent change the viewer is allowed to see.
+        if r["updated_at"] and (not item["updated_at"] or r["updated_at"] > item["updated_at"]):
+            item["updated_at"], item["updated_by_name"] = r["updated_at"], r["updated_by_name"]
+    return {"owner_id": owner["id"], "owner_name": owner["name"], "is_owner": is_owner,
+            "locations": locations, "items": list(items.values())}
+
+
+def api_stock(h, conn):
+    user = h.current_user(conn)
+    lists = []
+    if can_lead(user):
+        seed_locations(conn, user["id"])
+        mine = build_stock(conn, user, is_owner=True)
+        share = conn.execute("SELECT token FROM stock_shares WHERE owner_id = ?", (user["id"],)).fetchone()
+        mine["share_token"] = share["token"] if share else None
+        mine["editable_ids"] = [l["id"] for l in mine["locations"]]
+        lists.append(mine)
+    owners = conn.execute("""
+        SELECT DISTINCT u.* FROM stock_editors e JOIN stock_locations l ON l.id = e.location_id
+        JOIN users u ON u.id = l.owner_id WHERE e.user_id = ? AND u.id != ?""", (user["id"], user["id"])).fetchall()
+    for owner in owners:
+        _, ids = stock_role(conn, user, owner["id"])
+        lst = build_stock(conn, owner, visible_ids=ids)
+        lst["editable_ids"] = sorted(ids)
+        lists.append(lst)
+    return 200, {"lists": lists}
+
+
+def owned_location(conn, user, location_id):
+    if not can_lead(user):
+        raise ApiError(403, "Only team leaders can change locations.")
+    loc = conn.execute("SELECT * FROM stock_locations WHERE id = ? AND owner_id = ?",
+                       (int(location_id), user["id"])).fetchone()
+    if not loc:
+        raise ApiError(404, "Location not found.")
+    return loc
+
+
+def set_editors(conn, leader, location_id, editor_ids):
+    if not isinstance(editor_ids, list):
+        raise ApiError(400, "Choose team members from the list.")
+    conn.execute("DELETE FROM stock_editors WHERE location_id = ?", (location_id,))
+    for raw in dict.fromkeys(editor_ids):
+        try:
+            member = own_member(conn, leader, int(raw))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Choose team members from the list.")
+        conn.execute("INSERT INTO stock_editors (location_id, user_id) VALUES (?, ?)", (location_id, member["id"]))
+
+
+def api_stock_location_create(h, conn):
+    leader = require_leader(h, conn)
+    data = h.read_json()
+    name = text(data, "name", max_len=80)
+    sort = conn.execute("SELECT COALESCE(MAX(sort), -1) + 1 FROM stock_locations WHERE owner_id = ?",
+                        (leader["id"],)).fetchone()[0]
+    cur = conn.execute("INSERT INTO stock_locations (owner_id, name, sort, created_at) VALUES (?, ?, ?, ?)",
+                       (leader["id"], name, sort, now_iso()))
+    if "editor_ids" in data:
+        set_editors(conn, leader, cur.lastrowid, data["editor_ids"])
+    return 201, {"id": cur.lastrowid}
+
+
+def api_stock_location_update(h, conn, location_id):
+    leader = h.current_user(conn)
+    loc = owned_location(conn, leader, location_id)
+    data = h.read_json()
+    if "name" in data:
+        conn.execute("UPDATE stock_locations SET name = ? WHERE id = ?", (text(data, "name", max_len=80), loc["id"]))
+    if "editor_ids" in data:
+        set_editors(conn, leader, loc["id"], data["editor_ids"])
+    return 200, {"ok": True}
+
+
+def api_stock_location_delete(h, conn, location_id):
+    loc = owned_location(conn, h.current_user(conn), location_id)
+    if conn.execute("SELECT 1 FROM stock_levels WHERE location_id = ? AND qty > 0", (loc["id"],)).fetchone():
+        raise ApiError(409, f"{loc['name']} still has stock. Set its quantities to 0 first, or rename it instead.")
+    conn.execute("DELETE FROM stock_locations WHERE id = ?", (loc["id"],))
+    return 200, {"ok": True}
+
+
+def decode_photo(value):
+    if not isinstance(value, str) or "," not in value:
+        raise ApiError(400, "That photo couldn't be read. Try a JPG or PNG.")
+    try:
+        raw = base64.b64decode(value.split(",", 1)[1], validate=True)
+    except (ValueError, base64.binascii.Error):
+        raise ApiError(400, "That photo couldn't be read. Try a JPG or PNG.")
+    if len(raw) > MAX_PHOTO_BYTES:
+        raise ApiError(413, "That photo is too large.")
+    for magic, mime in PHOTO_TYPES.items():
+        if raw.startswith(magic) and (mime != "image/webp" or raw[8:12] == b"WEBP"):
+            return raw, mime
+    raise ApiError(400, "Photos must be JPG, PNG or WebP.")
+
+
+def int_field(value, label, low=0, high=MAX_QTY):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, f"{label} must be a whole number.")
+    if isinstance(value, float) and value != n or not low <= n <= high:
+        raise ApiError(400, f"{label} must be between {low} and {high:,}.")
+    return n
+
+
+def save_levels(conn, user, item_id, editable_ids, qty):
+    """Apply {location_id: qty} and record each change in the history."""
+    if not isinstance(qty, dict):
+        raise ApiError(400, "Quantities are invalid.")
+    for raw_loc, raw_n in qty.items():
+        try:
+            loc_id = int(raw_loc)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Quantities are invalid.")
+        if loc_id not in editable_ids:
+            raise ApiError(403, "You can only update the locations you're assigned to.")
+        n = int_field(raw_n, "Quantity")
+        row = conn.execute("SELECT qty FROM stock_levels WHERE item_id = ? AND location_id = ?",
+                           (item_id, loc_id)).fetchone()
+        old = row["qty"] if row else 0
+        if row and old == n:
+            continue
+        if not row and n == 0:
+            continue
+        conn.execute("""INSERT INTO stock_levels (item_id, location_id, qty, updated_by, updated_at)
+                        VALUES (?, ?, ?, ?, ?) ON CONFLICT (item_id, location_id)
+                        DO UPDATE SET qty = excluded.qty, updated_by = excluded.updated_by,
+                                      updated_at = excluded.updated_at""",
+                     (item_id, loc_id, n, user["id"], now_iso()))
+        conn.execute("INSERT INTO stock_history (item_id, location_id, old_qty, new_qty, user_name, at) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (item_id, loc_id, old, n, user["name"], now_iso()))
+
+
+def item_fields(data, partial):
+    fields = {}
+    if not partial or "name" in data:
+        fields["name"] = text(data, "name", max_len=120)
+    if not partial or "category" in data:
+        cat = data.get("category", "giveaway")
+        if cat not in CATEGORIES:
+            raise ApiError(400, "Type must be gift or giveaway.")
+        fields["category"] = cat
+    if not partial or "notes" in data:
+        fields["notes"] = text(data, "notes", required=False, max_len=1000)
+    if not partial or "min_qty" in data:
+        fields["min_qty"] = int_field(data.get("min_qty", 0) or 0, "Low stock alert")
+    return fields
+
+
+def api_stock_item_create(h, conn):
+    user = h.current_user(conn)
+    data = h.read_json(max_bytes=5_000_000)
+    owner_id = data.get("owner_id", user["id"])
+    _, editable = stock_role(conn, user, owner_id)
+    fields = item_fields(data, partial=False)
+    photo, mime = decode_photo(data["photo"]) if data.get("photo") else (None, None)
+    cur = conn.execute(
+        "INSERT INTO stock_items (owner_id, name, category, notes, min_qty, photo, photo_mime, photo_version, "
+        "created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (int(owner_id), fields["name"], fields["category"], fields["notes"], fields["min_qty"],
+         photo, mime, 1 if photo else 0, now_iso(), user["id"], now_iso()))
+    save_levels(conn, user, cur.lastrowid, editable, data.get("qty") or {})
+    return 201, {"id": cur.lastrowid}
+
+
+def stock_item(conn, user, item_id):
+    item = conn.execute("SELECT id, owner_id, name, category, notes, min_qty, photo_version FROM stock_items "
+                        "WHERE id = ?", (int(item_id),)).fetchone()
+    if not item:
+        raise ApiError(404, "Item not found.")
+    try:
+        is_owner, editable = stock_role(conn, user, item["owner_id"])
+    except ApiError:
+        raise ApiError(404, "Item not found.")
+    return item, is_owner, editable
+
+
+def api_stock_item_update(h, conn, item_id):
+    user = h.current_user(conn)
+    item, is_owner, editable = stock_item(conn, user, item_id)
+    data = h.read_json(max_bytes=5_000_000)
+    if not is_owner:
+        data.pop("min_qty", None)  # the low stock alert is the owner's setting
+    updates ={k: v for k, v in item_fields(data, partial=True).items() if v != item[k]}
+    if data.get("photo"):
+        updates["photo"], updates["photo_mime"] = decode_photo(data["photo"])
+        updates["photo_version"] = item["photo_version"] + 1
+    elif data.get("remove_photo"):
+        updates.update(photo=None, photo_mime=None, photo_version=item["photo_version"] + 1)
+    if updates:
+        updates.update(updated_by=user["id"], updated_at=now_iso())
+        assignments = ", ".join(f"{col} = ?" for col in updates)
+        conn.execute(f"UPDATE stock_items SET {assignments} WHERE id = ?", (*updates.values(), item["id"]))
+    if "qty" in data:
+        save_levels(conn, user, item["id"], editable, data["qty"])
+    return 200, {"ok": True}
+
+
+def api_stock_item_delete(h, conn, item_id):
+    user = h.current_user(conn)
+    item, is_owner, _ = stock_item(conn, user, item_id)
+    if not is_owner:
+        raise ApiError(403, "Only the list owner can delete items.")
+    conn.execute("DELETE FROM stock_items WHERE id = ?", (item["id"],))
+    return 200, {"ok": True}
+
+
+def api_stock_item_history(h, conn, item_id):
+    user = h.current_user(conn)
+    item, _, editable = stock_item(conn, user, item_id)
+    marks = ",".join("?" * len(editable)) or "NULL"
+    rows = conn.execute(
+        f"SELECT h.old_qty, h.new_qty, h.user_name, h.at, l.name AS location_name FROM stock_history h "
+        f"JOIN stock_locations l ON l.id = h.location_id WHERE h.item_id = ? AND h.location_id IN ({marks}) "
+        f"ORDER BY h.id DESC LIMIT 30", (item["id"], *editable)).fetchall()
+    return 200, {"history": [dict(r) for r in rows]}
+
+
+def send_photo(h, conn, owner_id, item_id):
+    row = conn.execute("SELECT photo, photo_mime FROM stock_items WHERE id = ? AND owner_id = ?",
+                       (int(item_id), owner_id)).fetchone()
+    if not row or row["photo"] is None:
+        raise ApiError(404, "No photo.")
+    return "bytes", (row["photo"], row["photo_mime"])
+
+
+def api_stock_item_photo(h, conn, item_id):
+    user = h.current_user(conn)
+    item, _, _ = stock_item(conn, user, item_id)
+    return send_photo(h, conn, item["owner_id"], item["id"])
+
+
+def api_stock_share(h, conn):
+    """Turn the manager's read-only link on (a fresh link each time) or off."""
+    leader = require_leader(h, conn)
+    data = h.read_json()
+    conn.execute("DELETE FROM stock_shares WHERE owner_id = ?", (leader["id"],))
+    token = None
+    if data.get("enabled"):
+        token = secrets.token_urlsafe(24)
+        conn.execute("INSERT INTO stock_shares (owner_id, token, created_at) VALUES (?, ?, ?)",
+                     (leader["id"], token, now_iso()))
+    return 200, {"share_token": token}
+
+
+def shared_owner(conn, token):
+    row = conn.execute("SELECT u.* FROM stock_shares s JOIN users u ON u.id = s.owner_id WHERE s.token = ?",
+                       (token,)).fetchone()
+    if not row:
+        raise ApiError(404, "This link was turned off or replaced. Ask for a new one.")
+    return row
+
+
+def api_stock_shared(h, conn, token):
+    return 200, {"list": build_stock(conn, shared_owner(conn, token))}
+
+
+def api_stock_shared_photo(h, conn, token, item_id):
+    return send_photo(h, conn, shared_owner(conn, token)["id"], item_id)
+
+
 ROUTES = [
     ("GET", r"/api/config", api_config),
     ("POST", r"/api/signup", api_signup),
@@ -550,6 +934,18 @@ ROUTES = [
     ("PATCH", r"/api/tasks/(\d+)", api_tasks_update),
     ("DELETE", r"/api/tasks/(\d+)", api_tasks_delete),
     ("POST", r"/api/tasks/(\d+)/cascade", api_tasks_cascade),
+    ("GET", r"/api/stock", api_stock),
+    ("POST", r"/api/stock/locations", api_stock_location_create),
+    ("PATCH", r"/api/stock/locations/(\d+)", api_stock_location_update),
+    ("DELETE", r"/api/stock/locations/(\d+)", api_stock_location_delete),
+    ("POST", r"/api/stock/items", api_stock_item_create),
+    ("PATCH", r"/api/stock/items/(\d+)", api_stock_item_update),
+    ("DELETE", r"/api/stock/items/(\d+)", api_stock_item_delete),
+    ("GET", r"/api/stock/items/(\d+)/history", api_stock_item_history),
+    ("GET", r"/api/stock/items/(\d+)/photo", api_stock_item_photo),
+    ("POST", r"/api/stock/share", api_stock_share),
+    ("GET", r"/api/stock/shared/([\w-]{20,64})", api_stock_shared),
+    ("GET", r"/api/stock/shared/([\w-]{20,64})/items/(\d+)/photo", api_stock_shared_photo),
 ]
 
 
@@ -592,7 +988,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with conn:
                     status, payload = fn(self, conn, *match.groups())
-                self.send_json(status, payload)
+                if status == "bytes":
+                    self.send_bytes(*payload)
+                else:
+                    self.send_json(status, payload)
             except ApiError as e:
                 self.send_json(e.status, {"error": e.message})
             except Exception:
@@ -604,13 +1003,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "Not found."})
 
     # --- request helpers ---
-    def read_json(self):
+    def read_json(self, max_bytes=100_000):
         # Requiring a JSON content type blocks cross-site form posts (CSRF).
         if not self.headers.get("Content-Type", "").startswith("application/json"):
             raise ApiError(415, "Expected a JSON request.")
         length = int(self.headers.get("Content-Length") or 0)
-        if length > 100_000:
-            raise ApiError(413, "Request is too large.")
+        if length > max_bytes:
+            raise ApiError(413, "Request is too large. Try a smaller photo." if max_bytes > 100_000
+                           else "Request is too large.")
         raw = self.rfile.read(length) if length else b"{}"
         try:
             data = json.loads(raw or b"{}")
@@ -667,6 +1067,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.common_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_bytes(self, body, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        # Photo URLs carry ?v=<version>, so a changed photo gets a new URL.
+        self.send_header("Cache-Control", "private, max-age=86400")
         self.common_headers()
         self.end_headers()
         self.wfile.write(body)

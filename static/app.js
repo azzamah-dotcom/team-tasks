@@ -97,6 +97,7 @@ const state = {
   query: "",
   authMode: "login",
   signupCodeRequired: false,
+  page: location.hash === "#stock" ? "stock" : "tasks", // "tasks" or "stock" (gifts & giveaways)
 };
 const app = $("#app");
 const isLeader = () => state.me?.role === "leader" || !!state.me?.can_lead; // sub-leaders lead a team too
@@ -152,17 +153,33 @@ function roleLabel() {
   return `Team of ${esc(me.leader_name || "your leader")}`;
 }
 
-function renderShell() {
-  const leader = isLeader();
-  app.innerHTML = `
+function topbar() {
+  const nav = state.me.stock_access ? `
+    <nav class="pages" aria-label="Sections">
+      <button type="button" data-action="page" data-page="tasks" class="${state.page === "tasks" ? "active" : ""}"
+        aria-current="${state.page === "tasks" ? "page" : "false"}">Tasks</button>
+      <button type="button" data-action="page" data-page="stock" class="${state.page === "stock" ? "active" : ""}"
+        aria-current="${state.page === "stock" ? "page" : "false"}">Gifts stock</button>
+    </nav>` : "";
+  return `
   <header class="topbar">
     <div class="brand"><span class="logo" aria-hidden="true">✓</span> <span class="brand-name"><span class="brand-zain">Zain</span> Team Tasks</span></div>
+    ${nav}
     <div class="who">
       <span class="who-name">${esc(state.me.name)}</span>
       <span class="chip">${roleLabel()}</span>
       <button type="button" class="btn ghost" data-action="logout">Sign out</button>
     </div>
-  </header>
+  </header>`;
+}
+
+function renderShell() {
+  if (!state.me.stock_access) state.page = "tasks";
+  if (state.page === "stock") return renderStockShell(); // stock.js
+  document.title = APP_NAME;
+  const leader = isLeader();
+  app.innerHTML = `
+  ${topbar()}
   <main class="wrap">
     <div id="notify-prompt"></div>
     <div id="banner"></div>
@@ -537,8 +554,10 @@ async function refresh() {
   try {
     const { user } = await api("GET", "/api/me");
     const wasLeader = isLeader();
+    const hadStock = state.me?.stock_access;
     state.me = user;
-    if (isLeader() !== wasLeader) renderShell(); // role changed since the page was drawn
+    if (isLeader() !== wasLeader || user.stock_access !== hadStock) renderShell(); // access changed since the page was drawn
+    if (state.page === "stock") return await refreshStock(); // stock.js
     const [{ tasks }, members] = await Promise.all([
       api("GET", "/api/tasks"),
       isLeader() ? api("GET", "/api/members") : Promise.resolve(null),
@@ -566,6 +585,7 @@ function enterApp(user) {
 }
 
 async function boot() {
+  if (location.hash.startsWith("#share=")) return bootShared(location.hash.slice(7)); // manager's read-only link
   try {
     state.signupCodeRequired = (await api("GET", "/api/config")).signup_code_required;
   } catch { /* older server or offline: show the default sign-up form */ }
@@ -649,6 +669,12 @@ app.addEventListener("click", async (e) => {
       case "auth-mode":
         state.authMode = el.dataset.mode;
         renderAuth();
+        break;
+      case "page":
+        state.page = el.dataset.page;
+        history.replaceState(null, "", state.page === "stock" ? "#stock" : location.pathname);
+        renderShell();
+        await refresh();
         break;
       case "logout":
         await api("POST", "/api/logout", {});
@@ -825,4 +851,5 @@ document.addEventListener("keydown", (e) => {
 setInterval(() => { if (state.me) refresh(); }, 60_000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden && state.me) refresh(); });
 
-boot();
+// stock.js loads after this file; wait for it before starting.
+document.addEventListener("DOMContentLoaded", boot);
