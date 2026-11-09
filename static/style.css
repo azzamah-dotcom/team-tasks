@@ -376,3 +376,9 @@ button, a, summary, label, input, select, textarea { touch-action: manipulation;
   .filters select,
   .search input { font-size: 16px; }
 }
+
+/* ---------- edits by team members ---------- */
+[hidden] { display: none !important; } /* keep hidden labels hidden despite label { display: block } */
+.edited { color: var(--teal); font-weight: 600; }
+.edit-note:empty { display: none; }
+.edit-note { margin: 0; }

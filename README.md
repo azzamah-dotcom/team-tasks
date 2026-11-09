@@ -3,7 +3,7 @@
 A task tracker for team leaders and their team members, with deadline reminders.
 
 - **Team leaders** sign up, add their team members, assign tasks with a deadline and priority, edit or delete them, and see the whole team's progress.
-- **Team members** sign in with the details their leader gave them, see only their own tasks, and mark each one done or not done.
+- **Team members** sign in with the details their leader gave them, see only their own tasks, and mark each one done or not done. They can also **edit** their tasks (title, details, priority, deadline). The leader sees "✎ Edited by …" on the task. Only the person who assigned a task can give it to someone else or delete it, and a cascaded copy can't be moved past the original deadline.
 - Each leader's team and tasks are private. Other leaders can't see them.
 - **Sub-leaders and cascading:** in **My team**, click **Make team leader** on a member. They can then add their own team. When you give them a task, they click **Cascade** to send a copy to some or all of their people, optionally with an earlier deadline. Your task shows "2 of 5 done" with each person's status and completes by itself when every copy is done. This works through any number of levels (you → supervisors → staff → …).
 - **Search:** find tasks by title, details or person (press `/` to jump to the search box). Search looks through every status, including done tasks.

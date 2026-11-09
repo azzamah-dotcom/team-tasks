@@ -45,6 +45,14 @@ function relTime(isoStr) {
   return ms >= 0 ? `in ${span}` : `${span} overdue`;
 }
 
+function ago(isoStr) {
+  const ms = Date.now() - new Date(isoStr);
+  if (ms < MIN) return "just now";
+  if (ms < HOUR) return `${Math.round(ms / MIN)}m ago`;
+  if (ms < DAY) return `${Math.round(ms / HOUR)}h ago`;
+  return `${Math.round(ms / DAY)}d ago`;
+}
+
 const fmtDate = (isoStr) => new Date(isoStr).toLocaleString(undefined,
   { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 
@@ -201,17 +209,6 @@ function renderShell() {
           </details>
         </section>
       </aside>
-      <dialog id="edit-dialog">
-        <form data-form="task-edit" class="stack">
-          <h2>Edit task</h2>
-          ${taskFields()}
-          <label class="check"><input type="checkbox" name="done"> Marked as done</label>
-          <div class="dialog-actions">
-            <button type="button" class="btn ghost" data-action="close-dialog">Cancel</button>
-            <button type="submit" class="btn primary">Save changes</button>
-          </div>
-        </form>
-      </dialog>
       <dialog id="cascade-dialog">
         <form data-form="cascade" class="stack">
           <h2>Cascade to my team</h2>
@@ -231,6 +228,18 @@ function renderShell() {
           </div>
         </form>
       </dialog>` : ""}
+      <dialog id="edit-dialog">
+        <form data-form="task-edit" class="stack">
+          <h2>Edit task</h2>
+          ${taskFields()}
+          <label class="check"><input type="checkbox" name="done"> Marked as done</label>
+          <p class="muted small edit-note"></p>
+          <div class="dialog-actions">
+            <button type="button" class="btn ghost" data-action="close-dialog">Cancel</button>
+            <button type="submit" class="btn primary">Save changes</button>
+          </div>
+        </form>
+      </dialog>
     </div>
   </main>`;
 
@@ -407,15 +416,16 @@ function taskItem(t) {
         ${received && leader ? `<span class="from">From ${hl(t.leader_name)}</span>` : ""}
         ${leader && mine ? `<span class="person">${forSelf ? "Me" : hl(t.assignee_name)}</span>` : ""}
         <span class="due">${dueText}</span>
+        ${t.updated_by && t.updated_by !== state.me.id && t.updated_by_name ? `
+        <span class="edited" title="Last edited ${esc(fmtDate(t.updated_at))}">✎ Edited by ${hl(t.updated_by_name)} · ${ago(t.updated_at)}</span>` : ""}
       </div>
       ${cascadeProgress(t)}
     </div>
-    ${mine || canCascade ? `
     <div class="task-actions">
       ${canCascade ? `<button type="button" class="btn small cascade-btn" data-action="cascade">⤵ ${auto ? "Cascade more" : "Cascade"}</button>` : ""}
-      ${mine ? `<button type="button" class="btn ghost small" data-action="edit">Edit</button>
-      <button type="button" class="btn ghost small danger" data-action="delete">Delete</button>` : ""}
-    </div>` : ""}
+      ${mine || forSelf ? `<button type="button" class="btn ghost small" data-action="edit">Edit</button>` : ""}
+      ${mine ? `<button type="button" class="btn ghost small danger" data-action="delete">Delete</button>` : ""}
+    </div>
   </li>`;
 }
 
@@ -572,13 +582,22 @@ async function boot() {
 function openEdit(task) {
   const dialog = $("#edit-dialog");
   const form = $("form", dialog);
+  const mine = task.leader_id === state.me.id;   // only the assigner can hand it to someone else
+  const auto = (task.children || []).length > 0; // completes from its cascaded copies
   form.dataset.taskId = task.id;
   form.elements.title.value = task.title;
-  form.elements.assignee_id.value = String(task.assignee_id);
+  const assignee = form.elements.assignee_id;
+  assignee.disabled = !mine;                      // disabled fields aren't sent
+  assignee.closest("label").hidden = !mine;
+  if (mine) assignee.value = String(task.assignee_id);
   form.elements.due_at.value = toLocalInput(task.due_at);
   form.elements.priority.value = task.priority;
   form.elements.description.value = task.description;
   form.elements.done.checked = task.status === "done";
+  form.elements.done.disabled = auto;
+  form.elements.done.closest("label").title = auto ? "Completes automatically when everyone it was cascaded to is done" : "";
+  $(".edit-note", form).textContent = mine ? "" :
+    `Assigned by ${task.leader_name}. They'll see that you edited it.`;
   $(".form-error", form)?.remove();
   dialog.showModal();
 }
@@ -720,13 +739,14 @@ app.addEventListener("click", async (e) => {
 });
 
 function taskPayload(fd) {
-  return {
+  const payload = {
     title: fd.title,
-    assignee_id: Number(fd.assignee_id),
     due_at: new Date(fd.due_at).toISOString(), // datetime-local is local time → send UTC
     priority: fd.priority,
     description: fd.description || "",
   };
+  if (fd.assignee_id) payload.assignee_id = Number(fd.assignee_id); // absent when the field is locked
+  return payload;
 }
 
 app.addEventListener("submit", async (e) => {
@@ -757,7 +777,9 @@ app.addEventListener("submit", async (e) => {
       }
       case "task-edit": {
         const id = form.dataset.taskId;
-        await api("PATCH", `/api/tasks/${id}`, { ...taskPayload(fd), status: form.elements.done.checked ? "done" : "open" });
+        const changes = taskPayload(fd);
+        if (!form.elements.done.disabled) changes.status = form.elements.done.checked ? "done" : "open";
+        await api("PATCH", `/api/tasks/${id}`, changes);
         $("#edit-dialog").close();
         toast("Task updated");
         await refresh();

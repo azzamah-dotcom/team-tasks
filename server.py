@@ -61,7 +61,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done')),
   done_at TEXT,
   created_at TEXT NOT NULL,
-  parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE  -- set when cascaded from a leader's task
+  parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,  -- set when cascaded from a leader's task
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,  -- last person to change the details
+  updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_users_leader ON users(leader_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_leader ON tasks(leader_id);
@@ -167,6 +169,8 @@ def db():
 MIGRATIONS = [
     ("users", "can_lead", "ALTER TABLE users ADD COLUMN can_lead INTEGER NOT NULL DEFAULT 0"),
     ("tasks", "parent_id", "ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE"),
+    ("tasks", "updated_by", "ALTER TABLE tasks ADD COLUMN updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+    ("tasks", "updated_at", "ALTER TABLE tasks ADD COLUMN updated_at TEXT"),
 ]
 
 
@@ -339,9 +343,10 @@ def api_members_delete(h, conn, member_id):
 
 
 TASK_SELECT = """
-    SELECT t.*, a.name AS assignee_name, l.name AS leader_name FROM tasks t
+    SELECT t.*, a.name AS assignee_name, l.name AS leader_name, e.name AS updated_by_name FROM tasks t
     JOIN users a ON a.id = t.assignee_id
     JOIN users l ON l.id = t.leader_id
+    LEFT JOIN users e ON e.id = t.updated_by
 """
 
 
@@ -440,14 +445,15 @@ def api_tasks_update(h, conn, task_id):
             updates["status"] = data["status"]
             updates["done_at"] = now_iso() if data["status"] == "done" else None
 
-    detail_fields = {"title", "description", "assignee_id", "due_at", "priority"} & data.keys()
-    if detail_fields and not is_creator:
-        raise ApiError(403, "Only the person who assigned this task can change its details.")
+    # Both the person who assigned the task and the person doing it can edit its details.
+    # Only the assigner can hand it to someone else (or delete it).
+    if "assignee_id" in data and not is_creator and str(data["assignee_id"]) != str(task["assignee_id"]):
+        raise ApiError(403, "Only the person who assigned this task can give it to someone else.")
     if "title" in data:
         updates["title"] = text(data, "title", max_len=140)
     if "description" in data:
         updates["description"] = text(data, "description", required=False, max_len=2000)
-    if "assignee_id" in data:
+    if "assignee_id" in data and is_creator:
         assignee_id = check_assignee(conn, user, data["assignee_id"])
         if assignee_id != task["assignee_id"] and has_children:
             raise ApiError(409, "This task has already been cascaded to a team, so it can't be reassigned. "
@@ -457,6 +463,12 @@ def api_tasks_update(h, conn, task_id):
         updates["due_at"] = check_child_deadline(conn, task["parent_id"], parse_deadline(data["due_at"]))
     if "priority" in data:
         updates["priority"] = check_priority(data["priority"])
+
+    # Record who last changed the details, but only when something actually changed.
+    detail_cols = {"title", "description", "assignee_id", "due_at", "priority"}
+    if any(col in detail_cols and updates[col] != task[col] for col in updates):
+        updates["updated_by"] = user["id"]
+        updates["updated_at"] = now_iso()
 
     if updates:
         assignments = ", ".join(f"{col} = ?" for col in updates)
