@@ -8,6 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
     TEAM_TASKS_DB=/data/team_tasks.db
 
 WORKDIR /app
+# Phone push notifications need the cryptography package (pinned).
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py reset_password.py ./
 COPY static ./static
 

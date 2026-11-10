@@ -171,6 +171,10 @@ function topbar() {
     <div class="who">
       <span class="who-name">${esc(state.me.name)}</span>
       <span class="chip">${roleLabel()}</span>
+      <button type="button" class="btn ghost bell-btn ${push.subscribed ? "on" : ""}" data-action="push-open"
+        aria-label="Phone notifications${push.subscribed ? " (on)" : ""}" title="Phone notifications">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/></svg>
+      </button>
       <button type="button" class="btn ghost" data-action="logout">Sign out</button>
     </div>
   </header>`;
@@ -326,15 +330,35 @@ function renderBanner(c) {
 
 function renderNotifyPrompt() {
   const el = $("#notify-prompt");
-  if (!("Notification" in window) || Notification.permission !== "default") {
+  if (!el) return;
+  let dismissed = false;
+  try { dismissed = localStorage.getItem("tt_push_prompt") === "no"; } catch { /* storage unavailable */ }
+  const what = isLeader() ? "your team finishes, reschedules or edits a task"
+                          : "a task you're working on is changed";
+  if (push.serverEnabled && !push.subscribed && !dismissed && push.needsInstall) {
+    el.innerHTML = `
+      <div class="notice">
+        <span>Get a notification on your iPhone when ${what}: tap <strong>Share</strong>, then
+          <strong>Add to Home Screen</strong>, and open Team Tasks from your home screen.</span>
+        <button type="button" class="btn small ghost" data-action="push-dismiss">Not now</button>
+      </div>`;
+  } else if (push.serverEnabled && push.supported && !push.subscribed && !dismissed
+             && Notification.permission !== "denied") {
+    el.innerHTML = `
+      <div class="notice">
+        <span>Get a notification on this device when ${what}.</span>
+        <button type="button" class="btn small primary" data-action="push-on">Turn on notifications</button>
+        <button type="button" class="btn small ghost" data-action="push-dismiss">Not now</button>
+      </div>`;
+  } else if (!push.supported && "Notification" in window && Notification.permission === "default") {
+    el.innerHTML = `
+      <div class="notice">
+        <span>Get a desktop alert when a task is due within 24 hours or becomes overdue.</span>
+        <button type="button" class="btn small" data-action="enable-notify">Turn on reminders</button>
+      </div>`;
+  } else {
     el.innerHTML = "";
-    return;
   }
-  el.innerHTML = `
-    <div class="notice">
-      <span>Get a desktop alert when a task is due within 24 hours or becomes overdue.</span>
-      <button type="button" class="btn small" data-action="enable-notify">Turn on reminders</button>
-    </div>`;
 }
 
 const VIEWS = [["open", "Open"], ["soon", "Due soon"], ["overdue", "Overdue"], ["done", "Done"], ["all", "All"]];
@@ -554,6 +578,168 @@ function checkReminders() {
   try { localStorage.setItem("tt_notified", JSON.stringify(seen)); } catch { /* ignore */ }
 }
 
+// ---------- phone push notifications ----------
+// The server sends a push when someone finishes, reopens, reschedules or edits a task you share.
+// On iPhone this only works once Team Tasks is added to the Home Screen (iOS 16.4 or later).
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+const push = {
+  supported: "serviceWorker" in navigator && "PushManager" in window && "Notification" in window,
+  needsInstall: false,  // iPhone Safari tab: must be added to the Home Screen first
+  serverEnabled: false,
+  publicKey: null,
+  subscribed: false,
+};
+push.needsInstall = isIOS && !isStandalone();
+
+function keyBytes(b64url) {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (b64url.length % 4)) % 4);
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+async function pushRegistration() {
+  if (!push.supported) return null;
+  try {
+    await navigator.serviceWorker.register("/sw.js");
+    return await navigator.serviceWorker.ready;
+  } catch { return null; }
+}
+
+// Check this device's state, and keep the server's copy of the subscription up to date.
+async function syncPush() {
+  try {
+    const info = await api("GET", "/api/push/key");
+    push.serverEnabled = info.enabled;
+    push.publicKey = info.public_key || null;
+  } catch { push.serverEnabled = false; }
+  const reg = push.serverEnabled ? await pushRegistration() : null;
+  const sub = reg ? await reg.pushManager.getSubscription() : null;
+  push.subscribed = Boolean(sub) && Notification.permission === "granted";
+  if (push.subscribed) {
+    try { await saveSubscription(sub); } catch { /* try again next time */ }
+  }
+  updateBell();
+  renderNotifyPrompt();
+}
+
+function saveSubscription(sub) {
+  return api("POST", "/api/push/subscribe", { ...sub.toJSON(), tz_offset: -new Date().getTimezoneOffset() });
+}
+
+async function pushTurnOn() {
+  if (push.needsInstall) throw new Error("On iPhone, add Team Tasks to your Home Screen first, then open it from there.");
+  if (!push.supported) throw new Error("This browser can't receive notifications.");
+  const permission = await Notification.requestPermission();  // must come first, straight from the tap
+  if (permission !== "granted") {
+    throw new Error("Notifications are blocked. Allow them for Team Tasks in your phone or browser settings.");
+  }
+  const reg = await pushRegistration();
+  if (!reg || !push.publicKey) throw new Error("Couldn't set up notifications. Reload and try again.");
+  let sub = await reg.pushManager.getSubscription();
+  try {
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(push.publicKey) });
+  } catch (err) {
+    if (err.name !== "InvalidStateError") throw err;   // an old subscription made with a different key
+    await sub?.unsubscribe();
+    sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(push.publicKey) });
+  }
+  await saveSubscription(sub);
+  push.subscribed = true;
+  updateBell();
+  renderNotifyPrompt();
+}
+
+async function pushTurnOff() {
+  const reg = await pushRegistration();
+  const sub = reg ? await reg.pushManager.getSubscription() : null;
+  if (sub) {
+    await api("POST", "/api/push/unsubscribe", { endpoint: sub.endpoint });
+    await sub.unsubscribe();
+  }
+  push.subscribed = false;
+  updateBell();
+  renderNotifyPrompt();
+}
+
+function updateBell() {
+  const bell = $(".bell-btn");
+  if (!bell) return;
+  bell.classList.toggle("on", push.subscribed);
+  bell.setAttribute("aria-label", `Phone notifications${push.subscribed ? " (on)" : ""}`);
+}
+
+function pushDialog() {
+  let dialog = $("#push-dialog");
+  if (!dialog) {
+    dialog = document.createElement("dialog");
+    dialog.id = "push-dialog";
+    document.body.append(dialog);
+    dialog.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-push]");
+      if (!btn) return;
+      const action = btn.dataset.push;
+      if (action === "close") return dialog.close();
+      btn.disabled = true;
+      try {
+        if (action === "on") { await pushTurnOn(); toast("Notifications are on for this device."); }
+        if (action === "off") { await pushTurnOff(); toast("Notifications are off for this device."); }
+        if (action === "test") { await api("POST", "/api/push/test", {}); toast("Test sent. It should arrive in a few seconds."); }
+      } catch (err) {
+        toast(err.message, true);
+      }
+      fillPushDialog();
+    });
+  }
+  return dialog;
+}
+
+function fillPushDialog() {
+  const dialog = pushDialog();
+  const what = isLeader()
+    ? "when someone on your team finishes a task, reopens it, moves its deadline or edits it"
+    : "when the person who gave you a task changes its deadline or details";
+  let status, buttons;
+  if (!push.serverEnabled) {
+    status = "Phone notifications aren't available on this server yet.";
+    buttons = "";
+  } else if (push.needsInstall) {
+    status = `To get notifications on iPhone, add Team Tasks to your Home Screen: tap <strong>Share</strong>
+      <span aria-hidden="true">(the square with an arrow)</span>, then <strong>Add to Home Screen</strong>.
+      Open Team Tasks from the new icon and turn notifications on there. Needs iOS 16.4 or later.`;
+    buttons = "";
+  } else if (!push.supported) {
+    status = "This browser can't receive notifications. Try Chrome, Edge, Firefox or Safari.";
+    buttons = "";
+  } else if (push.subscribed) {
+    status = `<strong>On for this device.</strong> You'll get a notification ${what}.`;
+    buttons = `<button type="button" class="btn ghost" data-push="off">Turn off</button>
+      <button type="button" class="btn primary" data-push="test">Send a test</button>`;
+  } else if (Notification.permission === "denied") {
+    status = "Notifications are blocked for Team Tasks. Allow them in your phone or browser settings, then come back here.";
+    buttons = "";
+  } else {
+    status = `Get a notification on this device ${what}. Turn it on for each phone or computer you use.`;
+    buttons = `<button type="button" class="btn primary" data-push="on">Turn on notifications</button>`;
+  }
+  dialog.innerHTML = `
+    <div class="stack">
+      <h2>Phone notifications</h2>
+      <p class="push-status">${status}</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" data-push="close">Close</button>
+        ${buttons}
+      </div>
+    </div>`;
+  return dialog;
+}
+
+if (push.supported) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data?.type === "refresh" && state.me) refresh();  // a notification was tapped
+  });
+}
+
 // ---------- loading ----------
 async function refresh() {
   try {
@@ -586,6 +772,7 @@ function enterApp(user) {
   state.view = "open";
   state.memberFilter = "all";
   renderShell();
+  syncPush();  // in the background: notification status for this device
   return refresh();
 }
 
@@ -690,6 +877,13 @@ app.addEventListener("click", async (e) => {
         await refresh();
         break;
       case "logout":
+        if (push.subscribed) {  // stop this person's notifications on this device; signing in again restores them
+          try {
+            const sub = await (await pushRegistration())?.pushManager.getSubscription();
+            if (sub) await api("POST", "/api/push/unsubscribe", { endpoint: sub.endpoint });
+          } catch { /* signing out still works */ }
+          push.subscribed = false;
+        }
         await api("POST", "/api/logout", {});
         state.me = null;
         state.tasks = [];
@@ -712,6 +906,21 @@ app.addEventListener("click", async (e) => {
         await Notification.requestPermission();
         renderNotifyPrompt();
         checkReminders();
+        break;
+      case "push-open":
+        fillPushDialog().showModal();
+        break;
+      case "push-on":
+        el.disabled = true;
+        try {
+          await pushTurnOn();
+          toast("Notifications are on for this device.");
+        } finally { el.disabled = false; }
+        break;
+      case "push-dismiss":
+        try { localStorage.setItem("tt_push_prompt", "no"); } catch { /* storage unavailable */ }
+        renderNotifyPrompt();
+        toast("You can turn notifications on any time from the bell at the top.");
         break;
       case "toggle": {
         if (!task) return;

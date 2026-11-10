@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Team Tasks — a task tracker for team leaders and their team members.
 
-Zero dependencies: Python 3.9+ standard library only (http.server + sqlite3).
+Python 3.9+ standard library (http.server + sqlite3). Phone push notifications also need the
+`cryptography` package (see requirements.txt); without it everything else still works.
 Run:  python3 server.py      then open http://127.0.0.1:8000
 """
 import base64
@@ -13,13 +14,27 @@ import os
 import re
 import secrets
 import sqlite3
+import struct
 import sys
+import threading
+import time
 import traceback
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:  # Web Push encryption (RFC 8291) and VAPID signing (RFC 8292)
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    PUSH_AVAILABLE = True
+except ImportError:
+    PUSH_AVAILABLE = False
 
 BASE = Path(__file__).resolve().parent
 STATIC = (BASE / "static").resolve()
@@ -121,6 +136,18 @@ CREATE TABLE IF NOT EXISTS stock_shares (
   token TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
+-- Phones and browsers that asked for push notifications (one row per device).
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  tz_offset INTEGER NOT NULL DEFAULT 0,  -- minutes east of UTC, for showing times in the push text
+  origin TEXT NOT NULL DEFAULT '',       -- the site's address, used as the VAPID contact
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_stock_loc_owner ON stock_locations(owner_id);
 CREATE INDEX IF NOT EXISTS idx_stock_items_owner ON stock_items(owner_id);
 CREATE INDEX IF NOT EXISTS idx_stock_editors_user ON stock_editors(user_id);
@@ -432,10 +459,11 @@ TASK_SELECT = """
 """
 
 
-def refresh_parent(conn, parent_id):
+def refresh_parent(conn, parent_id, completed=None):
     """A cascaded (parent) task is done exactly when all of its cascaded copies are done.
 
     Walks up the chain, so completing the last task at the bottom completes every level above.
+    If `completed` is a list, the ids of parent tasks that just became done are added to it.
     """
     while parent_id:
         parent = conn.execute("SELECT id, status, parent_id FROM tasks WHERE id = ?", (parent_id,)).fetchone()
@@ -448,6 +476,8 @@ def refresh_parent(conn, parent_id):
             if status != parent["status"]:
                 conn.execute("UPDATE tasks SET status = ?, done_at = ? WHERE id = ?",
                              (status, now_iso() if status == "done" else None, parent_id))
+                if status == "done" and completed is not None:
+                    completed.append(parent_id)
         parent_id = parent["parent_id"]
 
 
@@ -555,8 +585,10 @@ def api_tasks_update(h, conn, task_id):
     if updates:
         assignments = ", ".join(f"{col} = ?" for col in updates)
         conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", (*updates.values(), task["id"]))
+    completed_parents = []
     if "status" in updates:
-        refresh_parent(conn, task["parent_id"])
+        refresh_parent(conn, task["parent_id"], completed_parents)
+    queue_task_pushes(h, conn, user, task, updates, completed_parents)
     row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task["id"],)).fetchone()
     return 200, {"task": with_children(conn, [row])[0]}
 
@@ -615,6 +647,215 @@ def api_tasks_cascade(h, conn, task_id):
     row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task["id"],)).fetchone()
     return 201, {"created": created, "skipped": len(dict.fromkeys(ids)) - created,
                  "task": with_children(conn, [row])[0]}
+
+
+# ---------- phone push notifications (Web Push) ----------
+# When someone finishes, reopens, reschedules or edits a task, the other person on that task
+# (whoever assigned it, or whoever it's assigned to) gets a push on every device they turned
+# notifications on for. Messages are encrypted per RFC 8291 and signed with VAPID (RFC 8292),
+# so the phone's push service (Apple, Google, Mozilla) only relays them and can't read them.
+
+PUSH_TTL = 86400          # push services keep an undelivered message for up to a day
+_vapid_lock = threading.Lock()
+_vapid = {}               # cached private key and public key (base64url) for this database
+
+
+def b64u(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def b64u_decode(value):
+    value = value.strip()
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def vapid_keys(conn):
+    """The server's VAPID key pair, made once and kept in the database so subscriptions survive restarts."""
+    with _vapid_lock:
+        if not _vapid:
+            row = conn.execute("SELECT value FROM app_meta WHERE key = 'vapid_private_pem'").fetchone()
+            if row:
+                key = serialization.load_pem_private_key(row["value"].encode(), password=None)
+            else:
+                key = ec.generate_private_key(ec.SECP256R1())
+                pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                        serialization.NoEncryption()).decode()
+                conn.execute("INSERT INTO app_meta (key, value) VALUES ('vapid_private_pem', ?)", (pem,))
+                conn.commit()
+            public = key.public_key().public_bytes(serialization.Encoding.X962,
+                                                   serialization.PublicFormat.UncompressedPoint)
+            _vapid.update(key=key, public=b64u(public))
+        return _vapid["key"], _vapid["public"]
+
+
+def _hkdf_sha256(salt, ikm, info, length):
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()[:length]
+
+
+def encrypt_push(payload, ua_public_b64, auth_b64, as_private=None, salt=None):
+    """Encrypt a push message for one subscription (RFC 8291, aes128gcm, one record)."""
+    ua_public = b64u_decode(ua_public_b64)
+    auth_secret = b64u_decode(auth_b64)
+    as_private = as_private or ec.generate_private_key(ec.SECP256R1())
+    as_public = as_private.public_key().public_bytes(serialization.Encoding.X962,
+                                                     serialization.PublicFormat.UncompressedPoint)
+    ua_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ua_public)
+    ecdh_secret = as_private.exchange(ec.ECDH(), ua_key)
+    ikm = _hkdf_sha256(auth_secret, ecdh_secret, b"WebPush: info\x00" + ua_public + as_public, 32)
+    salt = salt or secrets.token_bytes(16)
+    cek = _hkdf_sha256(salt, ikm, b"Content-Encoding: aes128gcm\x00", 16)
+    nonce = _hkdf_sha256(salt, ikm, b"Content-Encoding: nonce\x00", 12)
+    ciphertext = AESGCM(cek).encrypt(nonce, payload + b"\x02", None)
+    header = salt + struct.pack("!IB", 4096, len(as_public)) + as_public
+    return header + ciphertext
+
+
+def vapid_header(endpoint, subject, conn=None, key=None, public=None):
+    if key is None:
+        key, public = vapid_keys(conn)
+    url = urlparse(endpoint)
+    claims = {"aud": f"{url.scheme}://{url.netloc}", "exp": int(time.time()) + 12 * 3600, "sub": subject}
+    signing_input = (b64u(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode()) + "." +
+                     b64u(json.dumps(claims, separators=(",", ":")).encode()))
+    r, s = decode_dss_signature(key.sign(signing_input.encode(), ec.ECDSA(hashes.SHA256())))
+    jwt = signing_input + "." + b64u(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+    return f"vapid t={jwt}, k={public}"
+
+
+def fmt_when(iso_value, tz_offset):
+    dt = datetime.fromisoformat(iso_value.replace("Z", "+00:00")) + timedelta(minutes=tz_offset)
+    return dt.strftime("%a %-d %b, %H:%M")
+
+
+def queue_push(h, user_id, title, body, tag, due_at=None):
+    """Remember a push to send once the request's database changes are saved."""
+    if PUSH_AVAILABLE and user_id:
+        h.push_queue.append({"user_id": user_id, "title": title, "body": body, "tag": tag, "due_at": due_at})
+
+
+def queue_task_pushes(h, conn, actor, task, updates, completed_parents):
+    """Work out who to tell about a change to a task, and what to say."""
+    if task["leader_id"] == task["assignee_id"]:
+        other = None  # a task someone gave themselves: nobody else to tell
+    else:
+        other = task["leader_id"] if actor["id"] == task["assignee_id"] else task["assignee_id"]
+    title = updates.get("title", task["title"])
+    name = actor["name"]
+    tag = f"task-{task['id']}"
+    if other:
+        if updates.get("status") == "done":
+            queue_push(h, other, f"{name} finished a task", title, tag)
+        elif updates.get("status") == "open":
+            queue_push(h, other, f"{name} reopened a task", title, tag)
+        changed = [c for c in ("title", "description", "priority", "assignee_id", "due_at")
+                   if c in updates and updates[c] != task[c]]
+        if "due_at" in changed:
+            queue_push(h, other, f"{name} changed a deadline", f"{title}\nNew deadline: {{due}}", tag,
+                       due_at=updates["due_at"])
+            changed.remove("due_at")
+        if changed:
+            labels = {"title": "title", "description": "details", "priority": "priority",
+                      "assignee_id": "who it's for"}
+            what = ", ".join(labels[c] for c in changed)
+            queue_push(h, other, f"{name} edited a task", f"{title}\nChanged: {what}", tag)
+    # A cascaded task completes when its whole team is done: tell whoever assigned it.
+    for parent_id in completed_parents:
+        parent = conn.execute("SELECT t.id, t.title, t.leader_id, t.assignee_id, a.name AS assignee_name "
+                              "FROM tasks t JOIN users a ON a.id = t.assignee_id WHERE t.id = ?",
+                              (parent_id,)).fetchone()
+        if parent and parent["leader_id"] != parent["assignee_id"]:
+            queue_push(h, parent["leader_id"], f"{parent['assignee_name']}'s team finished a task",
+                       f"{parent['title']}\nEveryone it was cascaded to is done.", f"task-{parent['id']}")
+
+
+def send_pushes(queue):
+    """Deliver queued pushes (runs on a background thread so the app stays fast)."""
+    conn = db()
+    try:
+        for item in queue:
+            subs = conn.execute("SELECT * FROM push_subscriptions WHERE user_id = ?", (item["user_id"],)).fetchall()
+            for sub in subs:
+                body = item["body"]
+                if item["due_at"]:
+                    body = body.replace("{due}", fmt_when(item["due_at"], sub["tz_offset"]))
+                payload = json.dumps({"title": item["title"], "body": body, "tag": item["tag"], "url": "/"}).encode()
+                try:
+                    data = encrypt_push(payload, sub["p256dh"], sub["auth"])
+                    req = urllib.request.Request(sub["endpoint"], data=data, method="POST", headers={
+                        "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream",
+                        "TTL": str(PUSH_TTL), "Urgency": "high",
+                        "Authorization": vapid_header(sub["endpoint"], sub["origin"] or "mailto:push@localhost", conn),
+                    })
+                    urllib.request.urlopen(req, timeout=10).close()
+                except urllib.error.HTTPError as e:
+                    if e.code in (404, 410):  # the device unsubscribed or the app was removed
+                        with conn:
+                            conn.execute("DELETE FROM push_subscriptions WHERE id = ?", (sub["id"],))
+                    else:
+                        print(f"Push to user {item['user_id']} failed: HTTP {e.code} {e.read()[:200]!r}")
+                except Exception as e:  # a bad subscription must never break other pushes
+                    print(f"Push to user {item['user_id']} failed: {e}")
+    finally:
+        conn.close()
+
+
+def require_push():
+    if not PUSH_AVAILABLE:
+        raise ApiError(503, "Phone notifications aren't set up on this server yet.")
+
+
+def api_push_key(h, conn):
+    if not PUSH_AVAILABLE:
+        return 200, {"enabled": False}
+    user = h.current_user(conn)
+    _, public = vapid_keys(conn)
+    count = conn.execute("SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ?", (user["id"],)).fetchone()[0]
+    return 200, {"enabled": True, "public_key": public, "devices": count}
+
+
+def api_push_subscribe(h, conn):
+    require_push()
+    user = h.current_user(conn)
+    data = h.read_json()
+    endpoint = data.get("endpoint")
+    keys = data.get("keys") or {}
+    if not isinstance(endpoint, str) or not endpoint.startswith("https://") or len(endpoint) > 1000:
+        raise ApiError(400, "That notification address isn't valid.")
+    try:
+        p256dh, auth = str(keys["p256dh"]), str(keys["auth"])
+        if len(b64u_decode(p256dh)) != 65 or len(b64u_decode(auth)) != 16:
+            raise ValueError
+    except (KeyError, ValueError, TypeError):
+        raise ApiError(400, "That notification key isn't valid.")
+    try:
+        tz_offset = max(-900, min(900, int(data.get("tz_offset", 0))))
+    except (TypeError, ValueError):
+        tz_offset = 0
+    host = h.headers.get("Host", "")
+    origin = f"{'https' if SECURE_COOKIES else 'http'}://{host}" if host else ""
+    conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))  # device changed hands
+    conn.execute("INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, tz_offset, origin, created_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)", (user["id"], endpoint, p256dh, auth, tz_offset, origin, now_iso()))
+    return 201, {"ok": True}
+
+
+def api_push_unsubscribe(h, conn):
+    user = h.current_user(conn)
+    data = h.read_json()
+    conn.execute("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?",
+                 (user["id"], str(data.get("endpoint", ""))))
+    return 200, {"ok": True}
+
+
+def api_push_test(h, conn):
+    require_push()
+    user = h.current_user(conn)
+    if not conn.execute("SELECT 1 FROM push_subscriptions WHERE user_id = ?", (user["id"],)).fetchone():
+        raise ApiError(409, "Turn on notifications on this device first.")
+    queue_push(h, user["id"], "Notifications are on", "You'll hear here when your team finishes, reschedules "
+               "or edits a task.", "test")
+    return 200, {"ok": True}
 
 
 # ---------- gifts & giveaways stock ----------
@@ -955,6 +1196,10 @@ ROUTES = [
     ("PATCH", r"/api/tasks/(\d+)", api_tasks_update),
     ("DELETE", r"/api/tasks/(\d+)", api_tasks_delete),
     ("POST", r"/api/tasks/(\d+)/cascade", api_tasks_cascade),
+    ("GET", r"/api/push/key", api_push_key),
+    ("POST", r"/api/push/subscribe", api_push_subscribe),
+    ("POST", r"/api/push/unsubscribe", api_push_unsubscribe),
+    ("POST", r"/api/push/test", api_push_test),
     ("GET", r"/api/stock", api_stock),
     ("POST", r"/api/stock/locations", api_stock_location_create),
     ("PATCH", r"/api/stock/locations/(\d+)", api_stock_location_update),
@@ -992,6 +1237,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self, method):
         self.extra_headers = []
+        self.push_queue = []
         path = urlparse(self.path).path
         if path.startswith("/api/"):
             self.handle_api(method, path)
@@ -1009,6 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with conn:
                     status, payload = fn(self, conn, *match.groups())
+                if self.push_queue:  # changes are saved: now tell people's phones
+                    threading.Thread(target=send_pushes, args=(self.push_queue,), daemon=True).start()
                 if status == "bytes":
                     self.send_bytes(*payload)
                 else:
@@ -1156,6 +1404,9 @@ def apply_env_password_reset():
 
 def main():
     mimetypes.add_type("application/javascript", ".js")
+    mimetypes.add_type("application/manifest+json", ".webmanifest")
+    if not PUSH_AVAILABLE:
+        print("Phone notifications are off: install the 'cryptography' package (pip install -r requirements.txt).")
     init_db()
     apply_env_password_reset()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
