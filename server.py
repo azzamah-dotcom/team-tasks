@@ -148,6 +148,11 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
+-- The local date each person last got their daily overdue summary, so it goes out once a day at most.
+CREATE TABLE IF NOT EXISTS push_daily (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  last_sent_date TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_stock_loc_owner ON stock_locations(owner_id);
 CREATE INDEX IF NOT EXISTS idx_stock_items_owner ON stock_items(owner_id);
 CREATE INDEX IF NOT EXISTS idx_stock_editors_user ON stock_editors(user_id);
@@ -800,6 +805,77 @@ def send_pushes(queue):
         conn.close()
 
 
+OVERDUE_HOUR = 9          # local time the daily overdue summary goes out
+OVERDUE_CHECK_SECONDS = 300
+
+
+def _titles(rows, with_names=False, limit=3):
+    items = [f"{r['assignee_name']}: {r['title']}" if with_names else r["title"] for r in rows[:limit]]
+    if len(rows) > limit:
+        items.append(f"+{len(rows) - limit} more")
+    return "; ".join(items)
+
+
+def send_daily_overdue(now=None):
+    """Once a day per person, at OVERDUE_HOUR their time: one push listing what's overdue.
+
+    Covers tasks assigned to them and, for leaders, tasks they gave out. Nobody overdue, no push.
+    The date is recorded before sending, so a restart can't send it twice.
+    """
+    now = now or datetime.now(timezone.utc)
+    now_s = iso(now)
+    conn = db()
+    queue = []
+    try:
+        users = conn.execute("SELECT user_id, MIN(tz_offset) AS tz FROM push_subscriptions GROUP BY user_id").fetchall()
+        for u in users:
+            local = now + timedelta(minutes=u["tz"])
+            if local.hour < OVERDUE_HOUR:
+                continue
+            today = local.strftime("%Y-%m-%d")
+            last = conn.execute("SELECT last_sent_date FROM push_daily WHERE user_id = ?", (u["user_id"],)).fetchone()
+            if last and last["last_sent_date"] == today:
+                continue
+            with conn:
+                conn.execute("INSERT INTO push_daily (user_id, last_sent_date) VALUES (?, ?) "
+                             "ON CONFLICT(user_id) DO UPDATE SET last_sent_date = excluded.last_sent_date",
+                             (u["user_id"], today))
+            mine = conn.execute(
+                "SELECT t.title FROM tasks t WHERE t.assignee_id = ? AND t.status = 'open' AND t.due_at < ? "
+                "AND NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_id = t.id) "  # cascaded on: listed under Team
+                "ORDER BY t.due_at", (u["user_id"], now_s)).fetchall()
+            # Tasks they gave out, including ones the assignee cascaded further down.
+            team = conn.execute(
+                "SELECT t.title, a.name AS assignee_name FROM tasks t JOIN users a ON a.id = t.assignee_id "
+                "WHERE t.leader_id = ? AND t.assignee_id != ? AND t.status = 'open' AND t.due_at < ? "
+                "ORDER BY t.due_at",
+                (u["user_id"], u["user_id"], now_s)).fetchall()
+            total = len(mine) + len(team)
+            if not total:
+                continue
+            lines = []
+            if mine:
+                lines.append(f"Yours: {_titles(mine)}")
+            if team:
+                lines.append(f"Team: {_titles(team, with_names=True)}")
+            queue.append({"user_id": u["user_id"], "title": f"{total} overdue task{'s' if total != 1 else ''}",
+                          "body": "\n".join(lines), "tag": "overdue-daily", "due_at": None})
+    finally:
+        conn.close()
+    if queue:
+        send_pushes(queue)
+    return queue
+
+
+def overdue_loop():
+    while True:
+        try:
+            send_daily_overdue()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(OVERDUE_CHECK_SECONDS)
+
+
 def require_push():
     if not PUSH_AVAILABLE:
         raise ApiError(503, "Phone notifications aren't set up on this server yet.")
@@ -1409,6 +1485,8 @@ def main():
         print("Phone notifications are off: install the 'cryptography' package (pip install -r requirements.txt).")
     init_db()
     apply_env_password_reset()
+    if PUSH_AVAILABLE:  # daily overdue summary, checked every few minutes
+        threading.Thread(target=overdue_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Team Tasks running at http://{HOST}:{PORT}  (database: {DB_PATH})")
     try:
