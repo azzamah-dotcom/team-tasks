@@ -12,6 +12,7 @@ A task tracker for managers, their team leaders and team members, with deadline 
 - **Stay signed in:** sign-ins last about a year and renew themselves while the app is used, so nobody is signed out unless they click **Sign out** (or their password is reset).
 - **Zain look:** colors come from the Zain Branding Kit 2026 (teal, navy, deep navy, magenta, yellow) and follow the device's light or dark mode.
 - **Reminders:** the app shows a banner and a counter for tasks due within 24 hours or overdue. Once a user turns on reminders, it also sends a desktop notification while the app is open. Data refreshes every minute.
+- **Phone notifications:** tap the 🔔 bell to turn them on for each phone or computer (on iPhone, add Team Tasks to the Home Screen first). You get one when you're **given a new task** (assigned, cascaded or reassigned to you), when the other person on a task finishes, reopens, reschedules or edits it, when a whole cascade is done, and once a day at 9:00 if anything is overdue.
 
 ## Run it
 

@@ -333,8 +333,8 @@ function renderNotifyPrompt() {
   if (!el) return;
   let dismissed = false;
   try { dismissed = localStorage.getItem("tt_push_prompt") === "no"; } catch { /* storage unavailable */ }
-  const what = isLeader() ? "your team finishes, reschedules or edits a task"
-                          : "a task you're working on is changed";
+  const what = isLeader() ? "you get a new task, or your team finishes, reschedules or edits one"
+                          : "you get a new task or one of yours is changed";
   if (push.serverEnabled && !push.subscribed && !dismissed && push.needsInstall) {
     el.innerHTML = `
       <div class="notice">
@@ -697,8 +697,8 @@ function pushDialog() {
 function fillPushDialog() {
   const dialog = pushDialog();
   const what = isLeader()
-    ? "when someone on your team finishes a task, reopens it, moves its deadline or edits it"
-    : "when the person who gave you a task changes its deadline or details";
+    ? "when you're given a new task, and when someone on your team finishes a task, reopens it, moves its deadline or edits it"
+    : "when you're given a new task, and when the person who gave it to you changes its deadline or details";
   let status, buttons;
   if (!push.serverEnabled) {
     status = "Phone notifications aren't available on this server yet.";

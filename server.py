@@ -537,6 +537,7 @@ def api_tasks_create(h, conn):
         "INSERT INTO tasks (leader_id, assignee_id, title, description, priority, due_at, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (leader["id"], assignee_id, title, description, priority, due_at, now_iso()))
+    queue_new_task_push(h, leader, assignee_id, cur.lastrowid, title, due_at)
     task = conn.execute(TASK_SELECT + " WHERE t.id = ?", (cur.lastrowid,)).fetchone()
     return 201, {"task": with_children(conn, [task])[0]}
 
@@ -642,11 +643,12 @@ def api_tasks_cascade(h, conn, task_id):
             raise ApiError(400, "Choose people from your own team.")
         if member["id"] in already:
             continue
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO tasks (leader_id, assignee_id, title, description, priority, due_at, created_at, parent_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (user["id"], member["id"], task["title"], task["description"], task["priority"], due_at,
              now_iso(), task["id"]))
+        queue_new_task_push(h, user, member["id"], cur.lastrowid, task["title"], due_at, cascaded=True)
         created += 1
     refresh_parent(conn, task["id"])
     row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task["id"],)).fetchone()
@@ -655,6 +657,7 @@ def api_tasks_cascade(h, conn, task_id):
 
 
 # ---------- phone push notifications (Web Push) ----------
+# Whoever is given a task (assigned, cascaded or reassigned to them) gets a push.
 # When someone finishes, reopens, reschedules or edits a task, the other person on that task
 # (whoever assigned it, or whoever it's assigned to) gets a push on every device they turned
 # notifications on for. Messages are encrypted per RFC 8291 and signed with VAPID (RFC 8292),
@@ -739,6 +742,14 @@ def queue_push(h, user_id, title, body, tag, due_at=None):
         h.push_queue.append({"user_id": user_id, "title": title, "body": body, "tag": tag, "due_at": due_at})
 
 
+def queue_new_task_push(h, giver, assignee_id, task_id, title, due_at, cascaded=False):
+    """Tell someone they've just been given a task (nothing to tell when it's your own)."""
+    if assignee_id == giver["id"]:
+        return
+    heading = f"{giver['name']} cascaded a task to you" if cascaded else f"{giver['name']} gave you a task"
+    queue_push(h, assignee_id, heading, f"{title}\nDue: {{due}}", f"task-{task_id}", due_at=due_at)
+
+
 def queue_task_pushes(h, conn, actor, task, updates, completed_parents):
     """Work out who to tell about a change to a task, and what to say."""
     if task["leader_id"] == task["assignee_id"]:
@@ -748,6 +759,9 @@ def queue_task_pushes(h, conn, actor, task, updates, completed_parents):
     title = updates.get("title", task["title"])
     name = actor["name"]
     tag = f"task-{task['id']}"
+    new_assignee = updates.get("assignee_id")
+    if new_assignee and new_assignee != task["assignee_id"]:
+        queue_new_task_push(h, actor, new_assignee, task["id"], title, updates.get("due_at", task["due_at"]))
     if other:
         if updates.get("status") == "done":
             queue_push(h, other, f"{name} finished a task", title, tag)
@@ -929,8 +943,8 @@ def api_push_test(h, conn):
     user = h.current_user(conn)
     if not conn.execute("SELECT 1 FROM push_subscriptions WHERE user_id = ?", (user["id"],)).fetchone():
         raise ApiError(409, "Turn on notifications on this device first.")
-    queue_push(h, user["id"], "Notifications are on", "You'll hear here when your team finishes, reschedules "
-               "or edits a task.", "test")
+    queue_push(h, user["id"], "Notifications are on", "You'll hear here about new tasks, and when a task you "
+               "share with someone is finished, rescheduled or edited.", "test")
     return 200, {"ok": True}
 
 
