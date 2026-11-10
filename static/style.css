@@ -522,3 +522,11 @@ button, a, summary, label, input, select, textarea { touch-action: manipulation;
   .photo-pick { flex-direction: column; align-items: flex-start; }
   .stock-panel .filters { width: 100%; }
 }
+
+/* stock upload */
+.item-code { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .02em; }
+#upload-dialog { width: min(640px, calc(100vw - 32px)); }
+.upload-sheets { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; max-height: 55vh; overflow: auto; }
+.upload-sheet { border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: grid; gap: 8px; }
+.upload-sheet-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; }
+.upload-sample { margin: 0; overflow-wrap: anywhere; }

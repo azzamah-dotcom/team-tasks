@@ -15,6 +15,7 @@ const stock = {
   shared: null,        // share token when viewing the manager's read-only link
   photoData: null,     // new photo (data URL) chosen in the item dialog
   removePhoto: false,
+  upload: null,        // {file, filename, sheets} while the upload dialog is open
 };
 
 const CAT_LABEL = { gift: "Gift", giveaway: "Giveaway" };
@@ -84,6 +85,9 @@ function stockMarkup(readOnly) {
       </div>
       <div class="row2">
         <label>Item name<input name="name" required maxlength="120" placeholder="e.g. Zain mug, power bank"></label>
+        <label>Item code <span class="muted">(optional)</span><input name="code" maxlength="40" placeholder="e.g. GIV-001-0263"></label>
+      </div>
+      <div class="row2">
         <label>Type<select name="category">
           <option value="giveaway">Giveaway</option><option value="gift">Gift</option>
         </select></label>
@@ -117,6 +121,20 @@ function stockMarkup(readOnly) {
       <div class="dialog-actions">
         <button type="button" class="btn ghost" data-action="close-dialog">Cancel</button>
         <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="upload-dialog">
+    <form data-form="stock-upload" class="stack">
+      <h2>Upload stock from Excel</h2>
+      <p class="muted small upload-intro"></p>
+      <ul class="upload-sheets"></ul>
+      <p class="muted small">Items are matched by their code, so uploading an updated file later changes the
+        quantities instead of adding the items again. Each quantity replaces what that location had, and every
+        change is kept in the item's history. Items not in the file aren't touched.</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" data-action="close-dialog">Cancel</button>
+        <button type="submit" class="btn primary">Upload</button>
       </div>
     </form>
   </dialog>
@@ -194,6 +212,8 @@ function renderStock() {
   const actions = [];
   if (canEditList(list)) actions.push(`<button type="button" class="btn primary" data-action="stock-add">+ Add item</button>`);
   if (list.is_owner) {
+    actions.push(`<label class="btn file-btn" title="Add or update items from an Excel (.xlsx) or CSV file">⬆ Upload Excel
+      <input type="file" id="stock-upload-file" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" class="visually-hidden"></label>`);
     actions.push(`<button type="button" class="btn" data-action="stock-locations">Locations &amp; people</button>`);
     actions.push(`<button type="button" class="btn" data-action="stock-share">${list.share_token ? "🔗 Shared" : "Share with manager"}</button>`);
   }
@@ -239,7 +259,7 @@ function filteredItems(list) {
   let hiddenEmpty = 0;
   const items = list.items.filter((it) => {
     if (stock.cat !== "all" && it.category !== stock.cat) return false;
-    if (terms.length && !terms.every((t) => norm(`${it.name} ${it.notes} ${CAT_LABEL[it.category]}`).includes(t))) return false;
+    if (terms.length && !terms.every((t) => norm(`${it.name} ${it.code || ""} ${it.notes} ${CAT_LABEL[it.category]}`).includes(t))) return false;
     if (stock.loc !== "all" && !stock.showEmpty && qtyAt(it, stock.loc) === 0) { hiddenEmpty++; return false; }
     return true;
   });
@@ -267,6 +287,7 @@ function itemCard(it, list) {
       </div>
       <div class="item-total"><strong>${nf(shownQty)}</strong> ${here ? `at ${esc(here.name)}` : "in stock"}
         ${low ? `<span class="low-badge" title="Alert set at ${nf(it.min_qty)}">Low stock</span>` : ""}</div>
+      ${it.code ? `<p class="item-code small muted">${esc(it.code)}</p>` : ""}
       ${locs}
       ${it.notes ? `<p class="item-notes small">${esc(it.notes)}</p>` : ""}
       <div class="item-foot">
@@ -308,6 +329,7 @@ function openItem(item) {
   $(".item-dialog-title", form).textContent = item ? "Update item" : "Add item";
   if (item) {
     form.elements.name.value = item.name;
+    form.elements.code.value = item.code || "";
     form.elements.category.value = item.category;
     form.elements.notes.value = item.notes;
     form.elements.min_qty.value = item.min_qty || "";
@@ -440,13 +462,76 @@ function renderShare() {
     <div><button type="button" class="btn primary" data-action="stock-share-set" data-on="1">Create link</button></div>`;
 }
 
+// ---------- upload from Excel ----------
+function readAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("That file couldn't be read."));
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function startUpload(file) {
+  if (file.size > 5_000_000) throw new Error("That file is too large (5 MB at most).");
+  const data = await readAsDataUrl(file);
+  const { sheets } = await api("POST", "/api/stock/import", { file: data, filename: file.name });
+  stock.upload = { file: data, filename: file.name, sheets };
+  const list = curList();
+  const form = $("#upload-dialog form");
+  $(".form-error", form)?.remove();
+  $(".upload-intro", form).textContent =
+    `${file.name}: choose where each sheet's quantities go. Nothing is saved until you click Upload.`;
+  $(".upload-sheets", form).innerHTML = sheets.map((s) => {
+    const options = list.locations.map((l) =>
+      `<option value="${l.id}" ${s.suggested_location_id === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+    const sample = s.sample.map((r) => `${esc(r.name)}${r.code ? ` <span class="muted">(${esc(r.code)})</span>` : ""}: ${nf(r.qty)}`).join(" · ");
+    return `
+    <li class="upload-sheet">
+      <div class="upload-sheet-head">
+        <strong>${esc(s.name)}</strong>
+        <span class="muted small">${plural(s.count, "row")} · ${nf(s.total)} pieces${s.skipped ? ` · <span class="bad">${s.skipped} skipped (quantity not a number)</span>` : ""}</span>
+      </div>
+      ${s.count ? `
+      <label>Goes into
+        <select name="sheet_${s.index}" data-sheet="${s.index}">
+          ${options}
+          <option value="new" ${s.suggested_location_id ? "" : "selected"}>New location: ${esc(s.name)}</option>
+          <option value="skip">Don't upload this sheet</option>
+        </select>
+      </label>
+      <p class="muted small upload-sample">${sample}${s.count > s.sample.length ? " …" : ""}</p>`
+      : `<p class="muted small">No items found in this sheet.</p>`}
+    </li>`;
+  }).join("");
+  $("#upload-dialog").showModal();
+}
+
+async function finishUpload(form) {
+  const up = stock.upload;
+  const choices = [];
+  for (const sel of $$("select[data-sheet]", form)) {
+    const sheet = up.sheets.find((s) => s.index === Number(sel.dataset.sheet));
+    if (sel.value === "skip") continue;
+    choices.push(sel.value === "new" ? { index: sheet.index, new_location: sheet.name }
+      : { index: sheet.index, location_id: Number(sel.value) });
+  }
+  if (!choices.length) throw new Error("Choose at least one sheet to upload.");
+  const r = await api("POST", "/api/stock/import", { file: up.file, filename: up.filename, sheets: choices });
+  stock.upload = null;
+  $("#upload-dialog").close();
+  const parts = [`${plural(r.created, "new item")}`, `${plural(r.updated, "item")} updated`];
+  if (r.new_locations) parts.push(`${plural(r.new_locations, "new location")}`);
+  toast(`Uploaded: ${parts.join(", ")}`);
+}
+
 // ---------- CSV export ----------
 function downloadCsv() {
   const list = curList();
   const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-  const head = ["Item", "Type", ...list.locations.map((l) => l.name), "Total", "Low stock alert at", "Notes", "Last updated"];
+  const head = ["Item", "Code", "Type", ...list.locations.map((l) => l.name), "Total", "Low stock alert at", "Notes", "Last updated"];
   const rows = list.items.map((it) => [
-    it.name, CAT_LABEL[it.category], ...list.locations.map((l) => qtyAt(it, l.id)), totalQty(it, list),
+    it.name, it.code || "", CAT_LABEL[it.category], ...list.locations.map((l) => qtyAt(it, l.id)), totalQty(it, list),
     it.min_qty || "", it.notes, it.updated_at ? fmtDate(it.updated_at) : "",
   ]);
   const csv = "﻿" + [head, ...rows].map((r) => r.map(cell).join(",")).join("\r\n"); // BOM so Excel reads Arabic
@@ -543,6 +628,12 @@ app.addEventListener("click", async (e) => {
 });
 
 app.addEventListener("change", async (e) => {
+  if (e.target.id === "stock-upload-file") {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (file) startUpload(file).catch((err) => toast(err.message, true));
+    return;
+  }
   if (!e.target.matches('#item-dialog input[name="photo_file"]')) return;
   const file = e.target.files[0];
   if (!file) return;
@@ -570,6 +661,7 @@ app.addEventListener("submit", async (e) => {
       for (const input of $$(".qty-grid input:not(:disabled)", form)) qty[input.dataset.loc] = Number(input.value) || 0;
       const payload = {
         name: form.elements.name.value,
+        code: form.elements.code.value,
         category: form.elements.category.value,
         notes: form.elements.notes.value,
         qty,
@@ -582,6 +674,8 @@ app.addEventListener("submit", async (e) => {
       else await api("POST", "/api/stock/items", { ...payload, owner_id: list.owner_id });
       $("#item-dialog").close();
       toast(id ? "Item updated" : `${payload.name.trim()} added`);
+    } else if (form.dataset.form === "stock-upload") {
+      await finishUpload(form);
     } else if (form.dataset.form === "stock-locations") {
       await saveLocations(form);
       $("#locations-dialog").close();

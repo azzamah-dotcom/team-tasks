@@ -6,6 +6,9 @@ Python 3.9+ standard library (http.server + sqlite3). Phone push notifications a
 Run:  python3 server.py      then open http://127.0.0.1:8000
 """
 import base64
+import csv
+import difflib
+import io
 import hashlib
 import hmac
 import json
@@ -19,8 +22,11 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -103,6 +109,7 @@ CREATE TABLE IF NOT EXISTS stock_items (
   id INTEGER PRIMARY KEY,
   owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
+  code TEXT NOT NULL DEFAULT '',           -- the company's item code (e.g. Oracle), used to match uploads
   category TEXT NOT NULL DEFAULT 'giveaway' CHECK (category IN ('gift', 'giveaway')),
   notes TEXT NOT NULL DEFAULT '',
   min_qty INTEGER NOT NULL DEFAULT 0,      -- flag as low stock at or below this total (0 = off)
@@ -263,6 +270,7 @@ MIGRATIONS = [
     ("tasks", "parent_id", "ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE"),
     ("tasks", "updated_by", "ALTER TABLE tasks ADD COLUMN updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL"),
     ("tasks", "updated_at", "ALTER TABLE tasks ADD COLUMN updated_at TEXT"),
+    ("stock_items", "code", "ALTER TABLE stock_items ADD COLUMN code TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -995,7 +1003,7 @@ def build_stock(conn, owner, visible_ids=None, is_owner=False):
                 "SELECT user_id FROM stock_editors WHERE location_id = ?", (loc["id"],))]
     items = {}
     for r in conn.execute("""
-        SELECT i.id, i.name, i.category, i.notes, i.min_qty, i.photo_version, i.created_at,
+        SELECT i.id, i.name, i.code, i.category, i.notes, i.min_qty, i.photo_version, i.created_at,
                i.photo IS NOT NULL AS has_photo, i.updated_at, u.name AS updated_by_name
         FROM stock_items i LEFT JOIN users u ON u.id = i.updated_by
         WHERE i.owner_id = ? ORDER BY i.name COLLATE NOCASE""", (owner["id"],)):
@@ -1147,6 +1155,8 @@ def item_fields(data, partial):
     fields = {}
     if not partial or "name" in data:
         fields["name"] = text(data, "name", max_len=120)
+    if not partial or "code" in data:
+        fields["code"] = text(data, "code", required=False, max_len=40)
     if not partial or "category" in data:
         cat = data.get("category", "giveaway")
         if cat not in CATEGORIES:
@@ -1167,16 +1177,16 @@ def api_stock_item_create(h, conn):
     fields = item_fields(data, partial=False)
     photo, mime = decode_photo(data["photo"]) if data.get("photo") else (None, None)
     cur = conn.execute(
-        "INSERT INTO stock_items (owner_id, name, category, notes, min_qty, photo, photo_mime, photo_version, "
-        "created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (int(owner_id), fields["name"], fields["category"], fields["notes"], fields["min_qty"],
+        "INSERT INTO stock_items (owner_id, name, code, category, notes, min_qty, photo, photo_mime, photo_version, "
+        "created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (int(owner_id), fields["name"], fields["code"], fields["category"], fields["notes"], fields["min_qty"],
          photo, mime, 1 if photo else 0, now_iso(), user["id"], now_iso()))
     save_levels(conn, user, cur.lastrowid, editable, data.get("qty") or {})
     return 201, {"id": cur.lastrowid}
 
 
 def stock_item(conn, user, item_id):
-    item = conn.execute("SELECT id, owner_id, name, category, notes, min_qty, photo_version FROM stock_items "
+    item = conn.execute("SELECT id, owner_id, name, code, category, notes, min_qty, photo_version FROM stock_items "
                         "WHERE id = ?", (int(item_id),)).fetchone()
     if not item:
         raise ApiError(404, "Item not found.")
@@ -1242,6 +1252,277 @@ def api_stock_item_photo(h, conn, item_id):
     return send_photo(h, conn, item["owner_id"], item["id"])
 
 
+# ---------- stock upload (Excel .xlsx or CSV) ----------
+# The owner uploads a spreadsheet; each sheet goes into one location they choose. Rows need an item
+# name or code and a quantity. Items are matched by their code, so uploading again updates them.
+
+MAX_UPLOAD_BYTES = 5_000_000
+MAX_UPLOAD_ROWS = 5000
+XL = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+XL_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+CODE_WORDS = ("code", "sku", "كود", "رمز", "رقم الصنف")
+QTY_WORDS = ("qty", "quantity", "quantities", "count", "stock", "balance", "on hand", "الكمية", "كمية", "العدد")
+NAME_WORDS = ("description", "desc", "item", "name", "product", "الوصف", "اسم", "الصنف", "المادة")
+
+
+def clean_cell(value):
+    value = unicodedata.normalize("NFKC", str(value if value is not None else ""))
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def name_key(name):
+    return clean_cell(name).casefold()
+
+
+def col_index(ref):
+    n = 0
+    for ch in re.match(r"[A-Z]+", ref).group():
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def read_xlsx(raw):
+    """Sheets of an .xlsx file as [(name, [[cell, ...], ...])], using only the standard library."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        strings = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(XL + "si"):
+                strings.append("".join(t.text or "" for t in si.iter(XL + "t")))
+        rels = {r.get("Id"): r.get("Target") for r in ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))}
+        sheets = []
+        for sh in ET.fromstring(z.read("xl/workbook.xml")).iter(XL + "sheet"):
+            if sh.get("state") in ("hidden", "veryHidden"):
+                continue
+            target = rels[sh.get(XL_REL)].lstrip("/")
+            target = target if target.startswith("xl/") else "xl/" + target
+            rows = []
+            for row in ET.fromstring(z.read(target)).iter(XL + "row"):
+                cells = {}
+                for c in row.iter(XL + "c"):
+                    v, kind = c.find(XL + "v"), c.get("t")
+                    if kind == "s" and v is not None:
+                        val = strings[int(v.text)]
+                    elif kind == "inlineStr":
+                        val = "".join(t.text or "" for t in c.iter(XL + "t"))
+                    else:
+                        val = v.text if v is not None else ""
+                    cells[col_index(c.get("r"))] = val
+                if cells:
+                    rows.append([cells.get(i, "") for i in range(max(cells) + 1)])
+                if len(rows) > MAX_UPLOAD_ROWS:
+                    raise ApiError(413, f"That sheet has more than {MAX_UPLOAD_ROWS:,} rows.")
+            sheets.append((clean_cell(sh.get("name")) or "Sheet", rows))
+        return sheets
+    except ApiError:
+        raise
+    except Exception:
+        raise ApiError(400, "That Excel file couldn't be read. Save it as .xlsx (or CSV) and try again.")
+
+
+def read_csv_file(raw, filename):
+    for enc in ("utf-8-sig", "cp1256", "latin-1"):
+        try:
+            content = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    rows = [r for r in csv.reader(io.StringIO(content)) if any(c.strip() for c in r)]
+    return [(re.sub(r"\.csv$", "", filename or "Sheet", flags=re.I) or "Sheet", rows[:MAX_UPLOAD_ROWS + 1])]
+
+
+def to_qty(value):
+    v = clean_cell(value).replace(",", "")
+    if not v:
+        return 0
+    n = float(v)
+    if n != int(n) or not 0 <= n <= MAX_QTY:
+        raise ValueError
+    return int(n)
+
+
+def find_columns(rows):
+    """(header row index, {"code": i, "name": i, "qty": i}) from the headings, or a guess from the data."""
+    for hi, row in enumerate(rows[:10]):
+        cols = {}
+        for i, cell in enumerate(row):
+            h = clean_cell(cell).casefold()
+            if not h:
+                continue
+            if "code" not in cols and any(w in h for w in CODE_WORDS):
+                cols["code"] = i
+            elif "qty" not in cols and any(w in h for w in QTY_WORDS):
+                cols["qty"] = i
+            elif "name" not in cols and any(w in h for w in NAME_WORDS):
+                cols["name"] = i
+        if "qty" in cols and ("name" in cols or "code" in cols):
+            return hi, cols
+    # No headings: numbers are the quantity, the longest text is the name.
+    width = max((len(r) for r in rows), default=0)
+    stats = []
+    for i in range(width):
+        vals = [clean_cell(r[i]) for r in rows if i < len(r) and clean_cell(r[i])]
+        numeric = sum(1 for v in vals if re.fullmatch(r"[\d,]+(\.0+)?", v))
+        stats.append((i, len(vals), numeric, sum(len(v) for v in vals) / (len(vals) or 1)))
+    qty = max((s for s in stats if s[1] and s[2] / s[1] > 0.8), key=lambda s: s[2], default=None)
+    texts = [s for s in stats if s[1] and (not qty or s[0] != qty[0])]
+    if not qty or not texts:
+        return None, {}
+    texts.sort(key=lambda s: -s[3])
+    cols = {"qty": qty[0], "name": texts[0][0]}
+    if len(texts) > 1:
+        cols["code"] = texts[1][0]
+    return -1, cols
+
+
+def parse_upload(data):
+    raw_value = data.get("file")
+    if not isinstance(raw_value, str) or not raw_value:
+        raise ApiError(400, "Choose an Excel or CSV file.")
+    try:
+        raw = base64.b64decode(raw_value.split(",", 1)[-1], validate=True)
+    except (ValueError, base64.binascii.Error):
+        raise ApiError(400, "That file couldn't be read.")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise ApiError(413, "That file is too large (5 MB at most).")
+    filename = str(data.get("filename", ""))
+    if raw[:2] == b"PK":
+        sheets = read_xlsx(raw)
+    elif raw[:4] == b"\xd0\xcf\x11\xe0":
+        raise ApiError(400, "That's an old .xls file. Open it in Excel and save it as .xlsx, then upload it again.")
+    else:
+        sheets = read_csv_file(raw, filename)
+    parsed = []
+    for idx, (name, rows) in enumerate(sheets):
+        header, cols = find_columns(rows)
+        sheet = {"index": idx, "name": name, "rows": [], "skipped": 0, "columns": {}}
+        if header is not None:
+            heads = rows[header] if header >= 0 else []
+            sheet["columns"] = {k: clean_cell(heads[i]) if i < len(heads) else f"Column {i + 1}" for k, i in cols.items()}
+            for row in rows[header + 1:]:
+                get = lambda k: row[cols[k]] if k in cols and cols[k] < len(row) else ""
+                code, name_ = clean_cell(get("code"))[:40], clean_cell(get("name"))
+                if not code and not name_:
+                    continue
+                if not re.search(r"\w", name_):
+                    name_ = code  # a placeholder like "." for a name
+                try:
+                    qty = to_qty(get("qty"))
+                except ValueError:
+                    sheet["skipped"] += 1
+                    continue
+                sheet["rows"].append({"code": code, "name": name_[:120], "qty": qty})
+        parsed.append(sheet)
+    if not any(s["rows"] for s in parsed):
+        raise ApiError(400, "No items found. The file needs columns for the item (name or code) and the quantity.")
+    return parsed
+
+
+def item_keys(sheets):
+    """How rows are matched to items: by code, except codes reused for different items in one sheet."""
+    ambiguous = set()
+    for s in sheets:
+        names = {}
+        for r in s["rows"]:
+            if r["code"]:
+                names.setdefault(r["code"].casefold(), set()).add(name_key(r["name"]))
+        ambiguous |= {c for c, n in names.items() if len(n) > 1}
+
+    def key(code, name):
+        c = code.casefold()
+        if c and c not in ambiguous:
+            return ("c", c)
+        return ("cn", c, name_key(name))
+    return key
+
+
+def suggest_location(sheet_name, locations):
+    best, score = None, 0.0
+    target = name_key(sheet_name)
+    for loc in locations:
+        ratio = difflib.SequenceMatcher(None, target, name_key(loc["name"])).ratio()
+        if ratio > score:
+            best, score = loc, ratio
+    return best["id"] if best and score >= 0.75 else None
+
+
+def api_stock_import(h, conn):
+    owner = require_leader(h, conn)
+    data = h.read_json(max_bytes=8_000_000)
+    seed_locations(conn, owner["id"])
+    sheets = parse_upload(data)
+    locations = [dict(r) for r in conn.execute(
+        "SELECT id, name FROM stock_locations WHERE owner_id = ? ORDER BY sort, id", (owner["id"],))]
+    if "sheets" not in data:  # preview: nothing is saved yet
+        return 200, {"sheets": [{
+            "index": s["index"], "name": s["name"], "count": len(s["rows"]), "skipped": s["skipped"],
+            "total": sum(r["qty"] for r in s["rows"]), "columns": s["columns"], "sample": s["rows"][:4],
+            "suggested_location_id": suggest_location(s["name"], locations),
+        } for s in sheets]}
+
+    # Apply: each chosen sheet goes into an existing location or a new one.
+    choices = data["sheets"]
+    if not isinstance(choices, list):
+        raise ApiError(400, "Choose a location for each sheet.")
+    loc_ids = {l["id"] for l in locations}
+    by_index = {s["index"]: s for s in sheets}
+    plan, new_locations = [], 0
+    for choice in choices:
+        sheet = by_index.get(choice.get("index") if isinstance(choice, dict) else None)
+        if not sheet:
+            raise ApiError(400, "That sheet isn't in the file.")
+        if choice.get("new_location"):
+            name = text(choice, "new_location", max_len=80)
+            existing = next((l["id"] for l in locations if name_key(l["name"]) == name_key(name)), None)
+            if existing:
+                loc_id = existing
+            else:
+                sort = conn.execute("SELECT COALESCE(MAX(sort), -1) + 1 FROM stock_locations WHERE owner_id = ?",
+                                    (owner["id"],)).fetchone()[0]
+                loc_id = conn.execute("INSERT INTO stock_locations (owner_id, name, sort, created_at) VALUES (?, ?, ?, ?)",
+                                      (owner["id"], name, sort, now_iso())).lastrowid
+                locations.append({"id": loc_id, "name": name})
+                loc_ids.add(loc_id)
+                new_locations += 1
+        else:
+            try:
+                loc_id = int(choice.get("location_id"))
+            except (TypeError, ValueError):
+                raise ApiError(400, f"Choose a location for “{sheet['name']}”.")
+            if loc_id not in loc_ids:
+                raise ApiError(404, "Location not found.")
+        plan.append((sheet, loc_id))
+    if not plan:
+        raise ApiError(400, "Choose at least one sheet to upload.")
+
+    key = item_keys([s for s, _ in plan])
+    items = {}
+    for it in conn.execute("SELECT id, name, code FROM stock_items WHERE owner_id = ? ORDER BY id", (owner["id"],)):
+        items.setdefault(key(it["code"], it["name"]), it["id"])
+        if not it["code"]:
+            items.setdefault(("n", name_key(it["name"])), it["id"])
+    levels, created = {}, 0
+    for sheet, loc_id in plan:
+        for r in sheet["rows"]:
+            k = key(r["code"], r["name"])
+            item_id = items.get(k) or (None if r["code"] else items.get(("n", name_key(r["name"]))))
+            if not item_id:
+                item_id = conn.execute(
+                    "INSERT INTO stock_items (owner_id, name, code, category, created_at, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, 'giveaway', ?, ?, ?)",
+                    (owner["id"], r["name"], r["code"], now_iso(), owner["id"], now_iso())).lastrowid
+                created += 1
+            items[k] = item_id
+            levels.setdefault(item_id, {}).setdefault(loc_id, 0)
+            levels[item_id][loc_id] += r["qty"]  # the same item twice in one sheet: add them up
+    before = conn.execute("SELECT COUNT(*) FROM stock_history").fetchone()[0]
+    for item_id, qty in levels.items():
+        save_levels(conn, owner, item_id, loc_ids, {str(l): n for l, n in qty.items()})
+    changed = conn.execute("SELECT COUNT(*) FROM stock_history").fetchone()[0] - before
+    return 200, {"created": created, "updated": len(levels) - created, "quantities_changed": changed,
+                 "new_locations": new_locations}
+
+
 def api_stock_share(h, conn):
     """Turn the manager's read-only link on (a fresh link each time) or off."""
     leader = require_leader(h, conn)
@@ -1300,6 +1581,7 @@ ROUTES = [
     ("GET", r"/api/stock/items/(\d+)/history", api_stock_item_history),
     ("GET", r"/api/stock/items/(\d+)/photo", api_stock_item_photo),
     ("POST", r"/api/stock/share", api_stock_share),
+    ("POST", r"/api/stock/import", api_stock_import),
     ("GET", r"/api/stock/shared/([\w-]{20,64})", api_stock_shared),
     ("GET", r"/api/stock/shared/([\w-]{20,64})/items/(\d+)/photo", api_stock_shared_photo),
 ]
