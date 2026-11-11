@@ -134,6 +134,8 @@ function stockMarkup(readOnly) {
       <h2>Upload stock from Excel</h2>
       <p class="muted small upload-intro"></p>
       <ul class="upload-sheets"></ul>
+      <label class="check upload-replace" hidden><input type="checkbox" name="replace_photos">
+        Also replace photos that items already have <span class="muted small">(otherwise pictures only fill items without one)</span></label>
       <p class="muted small">Items are matched by their code, so uploading an updated file later changes the
         quantities instead of adding the items again. If the same item is in more than one sheet going to the same
         location, the quantities are added together. Each total replaces what that location had, and every change is
@@ -510,7 +512,7 @@ function readAsDataUrl(file) {
 }
 
 async function startUpload(file) {
-  if (file.size > 5_000_000) throw new Error("That file is too large (5 MB at most).");
+  if (file.size > 20_000_000) throw new Error("That file is too large (20 MB at most).");
   const data = await readAsDataUrl(file);
   const { sheets } = await api("POST", "/api/stock/import", { file: data, filename: file.name });
   stock.upload = { file: data, filename: file.name, sheets };
@@ -531,7 +533,7 @@ async function startUpload(file) {
     <li class="upload-sheet">
       <div class="upload-sheet-head">
         <strong>${esc(s.name)}</strong>
-        <span class="muted small">${plural(s.count, "row")} · ${nf(s.total)} pieces${s.skipped ? ` · <span class="bad">${s.skipped} skipped (quantity not a number)</span>` : ""}</span>
+        <span class="muted small">${plural(s.count, "row")} · ${nf(s.total)} pieces${s.photos ? ` · 📷 ${plural(s.photos, "picture")}` : ""}${s.skipped ? ` · <span class="bad">${s.skipped} skipped (quantity not a number)</span>` : ""}${s.photos_too_large ? ` · <span class="bad">${plural(s.photos_too_large, "picture")} too large (over 3 MB)</span>` : ""}</span>
       </div>
       ${s.count ? `
       <label>Goes into
@@ -544,6 +546,10 @@ async function startUpload(file) {
       : `<p class="muted small">No items found in this sheet.</p>`}
     </li>`;
   }).join("");
+  const photos = sheets.reduce((n, s) => n + (s.photos || 0), 0);
+  const replace = $(".upload-replace", form);
+  replace.hidden = !photos;
+  replace.querySelector("input").checked = false;
   $("#upload-dialog").showModal();
 }
 
@@ -556,10 +562,12 @@ async function finishUpload(form) {
     choices.push({ index: sheet.index, location_id: Number(sel.value) });
   }
   if (!choices.length) throw new Error("Choose at least one sheet to upload.");
-  const r = await api("POST", "/api/stock/import", { file: up.file, filename: up.filename, sheets: choices });
+  const r = await api("POST", "/api/stock/import", { file: up.file, filename: up.filename, sheets: choices,
+    replace_photos: form.elements.replace_photos.checked });
   stock.upload = null;
   $("#upload-dialog").close();
   const parts = [`${plural(r.created, "new item")}`, `${plural(r.updated, "item")} updated`];
+  if (r.photos_added) parts.push(plural(r.photos_added, "photo") + " added");
   toast(`Uploaded: ${parts.join(", ")}`);
 }
 

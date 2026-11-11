@@ -1298,7 +1298,7 @@ def api_stock_item_photo(h, conn, item_id):
 # The owner uploads a spreadsheet; each sheet goes into one location they choose. Rows need an item
 # name or code and a quantity. Items are matched by their code, so uploading again updates them.
 
-MAX_UPLOAD_BYTES = 5_000_000
+MAX_UPLOAD_BYTES = 20_000_000   # Excel files with pictures get big
 MAX_UPLOAD_ROWS = 5000
 XL = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 XL_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
@@ -1323,38 +1323,168 @@ def col_index(ref):
     return n - 1
 
 
+PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
+XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
+DML = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+R_EMBED = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+
+def zip_path(base, target):
+    """Resolve a relationship target (relative to the part `base`) to a path inside the zip."""
+    if target.startswith("/"):
+        return target.lstrip("/")
+    parts = base.split("/")[:-1]
+    for piece in target.split("/"):
+        if piece == "..":
+            if parts:
+                parts.pop()
+        elif piece and piece != ".":
+            parts.append(piece)
+    return "/".join(parts)
+
+
+def part_rels(z, part):
+    """{rId: (type, resolved path)} for a part, from its _rels file (empty if it has none)."""
+    folder, _, name = part.rpartition("/")
+    rels_path = f"{folder}/_rels/{name}.rels" if folder else f"_rels/{name}.rels"
+    if rels_path not in z.namelist():
+        return {}
+    return {r.get("Id"): (r.get("Type", ""), zip_path(part, r.get("Target", "")))
+            for r in ET.fromstring(z.read(rels_path)).iter(PKG_REL)}
+
+
+def picture(z, path):
+    """(bytes, mime) for a JPG/PNG/WebP picture in the file, or None for other formats."""
+    if path not in z.namelist():
+        return None
+    data = z.read(path)
+    for magic, mime in PHOTO_TYPES.items():
+        if data.startswith(magic) and (mime != "image/webp" or data[8:12] == b"WEBP"):
+            return data, mime
+    return None
+
+
+def drawing_pictures(z, sheet_part):
+    """Pictures placed over the sheet: {0-based row: [(first row, last row, col, picture)]}."""
+    found = []
+    for kind, drawing in part_rels(z, sheet_part).values():
+        if not kind.endswith("/drawing") or drawing not in z.namelist():
+            continue
+        media = part_rels(z, drawing)
+        for anchor in ET.fromstring(z.read(drawing)):
+            start = anchor.find(XDR + "from")
+            if start is None:
+                continue  # absolute anchors aren't tied to a row
+            end = anchor.find(XDR + "to")
+            row, col = int(start.findtext(XDR + "row", "0")), int(start.findtext(XDR + "col", "0"))
+            last = int(end.findtext(XDR + "row", str(row))) if end is not None else row
+            for blip in anchor.iter(DML + "blip"):
+                target = media.get(blip.get(R_EMBED))
+                pic = picture(z, target[1]) if target else None
+                if pic:
+                    found.append((row, last, col, pic))
+                    break
+    return found
+
+
+def cell_pictures(z):
+    """Pictures placed in cells (Excel's "Place in cell"): {value-metadata index (1-based): picture}."""
+    names = set(z.namelist())
+    if "xl/metadata.xml" not in names or "xl/richData/rdrichvalue.xml" not in names:
+        return {}
+    rich = "{http://schemas.microsoft.com/office/spreadsheetml/2017/richdata}"
+    rich2 = "{http://schemas.microsoft.com/office/spreadsheetml/2017/richdata2}"
+    rel_ns = "{http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel}"
+    # Which position in each rich value holds the picture's number.
+    key_pos = {}
+    if "xl/richData/rdrichvaluestructure.xml" in names:
+        for i, st in enumerate(ET.fromstring(z.read("xl/richData/rdrichvaluestructure.xml")).iter(rich + "s")):
+            for j, k in enumerate(st.iter(rich + "k")):
+                if k.get("n") == "_rvRel:LocalImageIdentifier":
+                    key_pos[i] = j
+    values = []
+    for rv in ET.fromstring(z.read("xl/richData/rdrichvalue.xml")).iter(rich + "rv"):
+        vs = [v.text for v in rv.iter(rich + "v")]
+        pos = key_pos.get(int(rv.get("s", "0")), 0)
+        values.append(int(vs[pos]) if pos < len(vs) and (vs[pos] or "").isdigit() else None)
+    rel_part = "xl/richData/richValueRel.xml"
+    rel_ids = [r.get(R_ID) for r in ET.fromstring(z.read(rel_part)).iter()
+               if r.tag.endswith("}rel")] if rel_part in names else []
+    media = part_rels(z, rel_part)
+    # Cell vm="n" → valueMetadata block n → futureMetadata block → rich value index.
+    meta = ET.fromstring(z.read("xl/metadata.xml"))
+    future = []
+    for fm in meta.iter(XL + "futureMetadata"):
+        if fm.get("name") == "XLRICHVALUE":
+            for bk in fm.iter(XL + "bk"):
+                rvb = next((e for e in bk.iter() if e.tag.endswith("}rvb")), None)
+                future.append(int(rvb.get("i")) if rvb is not None else None)
+    value_meta = meta.find(XL + "valueMetadata")
+    blocks = list(value_meta.iter(XL + "bk")) if value_meta is not None else []
+    result = {}
+    for n, bk in enumerate(blocks, start=1):
+        rc = bk.find(XL + "rc")
+        v = int(rc.get("v", "0")) if rc is not None else n - 1
+        rv_index = future[v] if v < len(future) else n - 1
+        if rv_index is None or rv_index >= len(values) or values[rv_index] is None:
+            continue
+        rel_index = values[rv_index]
+        if rel_index < len(rel_ids) and rel_ids[rel_index] in media:
+            pic = picture(z, media[rel_ids[rel_index]][1])
+            if pic:
+                result[n] = pic
+    return result
+
+
 def read_xlsx(raw):
-    """Sheets of an .xlsx file as [(name, [[cell, ...], ...])], using only the standard library."""
+    """Sheets of an .xlsx file as [(name, rows, pictures)], using only the standard library.
+
+    rows[i] is spreadsheet row i + 1 (blank rows included, so pictures line up with their rows);
+    pictures is {row index: (bytes, mime)} for the JPG/PNG/WebP pictures sitting on or in a row.
+    """
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
         strings = []
         if "xl/sharedStrings.xml" in z.namelist():
             for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(XL + "si"):
                 strings.append("".join(t.text or "" for t in si.iter(XL + "t")))
-        rels = {r.get("Id"): r.get("Target") for r in ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))}
+        rels = part_rels(z, "xl/workbook.xml")
+        in_cell = cell_pictures(z)
         sheets = []
         for sh in ET.fromstring(z.read("xl/workbook.xml")).iter(XL + "sheet"):
             if sh.get("state") in ("hidden", "veryHidden"):
                 continue
-            target = rels[sh.get(XL_REL)].lstrip("/")
-            target = target if target.startswith("xl/") else "xl/" + target
-            rows = []
+            target = rels[sh.get(XL_REL)][1]
+            rows, pictures = [], {}
             for row in ET.fromstring(z.read(target)).iter(XL + "row"):
+                number = int(row.get("r") or len(rows) + 1)
+                if number > MAX_UPLOAD_ROWS + 1:
+                    raise ApiError(413, f"That sheet has more than {MAX_UPLOAD_ROWS:,} rows.")
+                while len(rows) < number - 1:
+                    rows.append([])
                 cells = {}
                 for c in row.iter(XL + "c"):
                     v, kind = c.find(XL + "v"), c.get("t")
-                    if kind == "s" and v is not None:
+                    if c.get("vm") and int(c.get("vm")) in in_cell:
+                        pictures.setdefault(number - 1, in_cell[int(c.get("vm"))])
+                        val = ""
+                    elif kind == "s" and v is not None:
                         val = strings[int(v.text)]
                     elif kind == "inlineStr":
                         val = "".join(t.text or "" for t in c.iter(XL + "t"))
                     else:
                         val = v.text if v is not None else ""
-                    cells[col_index(c.get("r"))] = val
-                if cells:
-                    rows.append([cells.get(i, "") for i in range(max(cells) + 1)])
-                if len(rows) > MAX_UPLOAD_ROWS:
-                    raise ApiError(413, f"That sheet has more than {MAX_UPLOAD_ROWS:,} rows.")
-            sheets.append((clean_cell(sh.get("name")) or "Sheet", rows))
+                    ref = c.get("r")
+                    cells[col_index(ref) if ref else len(cells)] = val
+                rows.append([cells.get(i, "") for i in range(max(cells) + 1)] if cells else [])
+            # A floating picture belongs to the first row it covers that has something in it.
+            for first, last, col, pic in sorted(drawing_pictures(z, target), key=lambda p: (p[0], p[2])):
+                for r in range(first, max(first, last) + 1):
+                    if r < len(rows) and any(clean_cell(x) for x in rows[r]):
+                        pictures.setdefault(r, pic)
+                        break
+            sheets.append((clean_cell(sh.get("name")) or "Sheet", rows, pictures))
         return sheets
     except ApiError:
         raise
@@ -1370,7 +1500,7 @@ def read_csv_file(raw, filename):
         except UnicodeDecodeError:
             continue
     rows = [r for r in csv.reader(io.StringIO(content)) if any(c.strip() for c in r)]
-    return [(re.sub(r"\.csv$", "", filename or "Sheet", flags=re.I) or "Sheet", rows[:MAX_UPLOAD_ROWS + 1])]
+    return [(re.sub(r"\.csv$", "", filename or "Sheet", flags=re.I) or "Sheet", rows[:MAX_UPLOAD_ROWS + 1], {})]
 
 
 def to_qty(value):
@@ -1426,7 +1556,7 @@ def parse_upload(data):
     except (ValueError, base64.binascii.Error):
         raise ApiError(400, "That file couldn't be read.")
     if len(raw) > MAX_UPLOAD_BYTES:
-        raise ApiError(413, "That file is too large (5 MB at most).")
+        raise ApiError(413, "That file is too large (20 MB at most).")
     filename = str(data.get("filename", ""))
     if raw[:2] == b"PK":
         sheets = read_xlsx(raw)
@@ -1435,13 +1565,13 @@ def parse_upload(data):
     else:
         sheets = read_csv_file(raw, filename)
     parsed = []
-    for idx, (name, rows) in enumerate(sheets):
+    for idx, (name, rows, pictures) in enumerate(sheets):
         header, cols = find_columns(rows)
-        sheet = {"index": idx, "name": name, "rows": [], "skipped": 0, "columns": {}}
+        sheet = {"index": idx, "name": name, "rows": [], "skipped": 0, "columns": {}, "photos_too_large": 0}
         if header is not None:
             heads = rows[header] if header >= 0 else []
             sheet["columns"] = {k: clean_cell(heads[i]) if i < len(heads) else f"Column {i + 1}" for k, i in cols.items()}
-            for row in rows[header + 1:]:
+            for number, row in enumerate(rows[header + 1:], start=header + 1):
                 get = lambda k: row[cols[k]] if k in cols and cols[k] < len(row) else ""
                 code, name_ = clean_cell(get("code"))[:40], clean_cell(get("name"))
                 if not code and not name_:
@@ -1453,7 +1583,13 @@ def parse_upload(data):
                 except ValueError:
                     sheet["skipped"] += 1
                     continue
-                sheet["rows"].append({"code": code, "name": name_[:120], "qty": qty})
+                entry = {"code": code, "name": name_[:120], "qty": qty}
+                pic = pictures.get(number)
+                if pic and len(pic[0]) > MAX_PHOTO_BYTES:
+                    sheet["photos_too_large"] += 1
+                elif pic:
+                    entry["photo"] = pic
+                sheet["rows"].append(entry)
         parsed.append(sheet)
     if not any(s["rows"] for s in parsed):
         raise ApiError(400, "No items found. The file needs columns for the item (name or code) and the quantity.")
@@ -1490,7 +1626,7 @@ def suggest_location(sheet_name, locations):
 
 def api_stock_import(h, conn):
     owner = require_leader(h, conn)
-    data = h.read_json(max_bytes=8_000_000)
+    data = h.read_json(max_bytes=28_000_000)
     seed_locations(conn, owner["id"])
     sheets = parse_upload(data)
     locations = [dict(r) for r in conn.execute(
@@ -1498,7 +1634,9 @@ def api_stock_import(h, conn):
     if "sheets" not in data:  # preview: nothing is saved yet
         return 200, {"sheets": [{
             "index": s["index"], "name": s["name"], "count": len(s["rows"]), "skipped": s["skipped"],
-            "total": sum(r["qty"] for r in s["rows"]), "columns": s["columns"], "sample": s["rows"][:4],
+            "total": sum(r["qty"] for r in s["rows"]), "columns": s["columns"],
+            "sample": [{k: r[k] for k in ("code", "name", "qty")} for r in s["rows"][:4]],
+            "photos": sum(1 for r in s["rows"] if "photo" in r), "photos_too_large": s["photos_too_large"],
             "suggested_location_id": suggest_location(s["name"], locations),
         } for s in sheets]}
 
@@ -1530,7 +1668,7 @@ def api_stock_import(h, conn):
         items.setdefault(key(it["code"], it["name"]), it["id"])
         if not it["code"]:
             items.setdefault(("n", name_key(it["name"])), it["id"])
-    levels, created = {}, 0
+    levels, created, photos = {}, 0, {}
     for sheet, loc_id in plan:
         for r in sheet["rows"]:
             k = key(r["code"], r["name"])
@@ -1542,13 +1680,26 @@ def api_stock_import(h, conn):
                     (owner["id"], r["name"], r["code"], now_iso(), owner["id"], now_iso())).lastrowid
                 created += 1
             items[k] = item_id
+            if "photo" in r:
+                photos.setdefault(item_id, r["photo"])  # the first picture found for an item wins
             levels.setdefault(item_id, {}).setdefault(loc_id, 0)
             levels[item_id][loc_id] += r["qty"]  # the same item twice in one sheet: add them up
     before = conn.execute("SELECT COUNT(*) FROM stock_history").fetchone()[0]
     for item_id, qty in levels.items():
         save_levels(conn, owner, item_id, loc_ids, {str(l): n for l, n in qty.items()})
     changed = conn.execute("SELECT COUNT(*) FROM stock_history").fetchone()[0] - before
-    return 200, {"created": created, "updated": len(levels) - created, "quantities_changed": changed}
+    # Pictures fill items that have none; with replace_photos they also replace existing ones.
+    replace = bool(data.get("replace_photos"))
+    photos_added = 0
+    for item_id, (pic, mime) in photos.items():
+        has = conn.execute("SELECT photo IS NOT NULL AS has FROM stock_items WHERE id = ?", (item_id,)).fetchone()["has"]
+        if has and not replace:
+            continue
+        conn.execute("UPDATE stock_items SET photo = ?, photo_mime = ?, photo_version = photo_version + 1 WHERE id = ?",
+                     (pic, mime, item_id))
+        photos_added += 1
+    return 200, {"created": created, "updated": len(levels) - created, "quantities_changed": changed,
+                 "photos_added": photos_added}
 
 
 def api_stock_share(h, conn):
