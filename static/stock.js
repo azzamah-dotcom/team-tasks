@@ -11,6 +11,7 @@ const stock = {
   loc: "all",          // location filter: "all" or a location id
   cat: "all",          // "all" | "gift" | "giveaway"
   query: "",
+  lowOnly: false,      // show only items running low
   showEmpty: false,    // with a location picked, also show items that have none there
   shared: null,        // share token when viewing the manager's read-only link
   photoData: null,     // new photo (data URL) chosen in the item dialog
@@ -26,7 +27,10 @@ const qtyAt = (item, locId) => item.qty[String(locId)] || 0;
 const totalQty = (item, list) => list.locations.reduce((n, l) => n + qtyAt(item, l.id), 0);
 // The alert is for the total across every location, so only the owner and the shared view (which see all) use it.
 const seesAll = (list) => list.is_owner || !!stock.shared;
-const isLow = (item, list) => seesAll(list) && item.min_qty > 0 && totalQty(item, list) <= item.min_qty;
+const LOW_DEFAULT = 50;  // running low: fewer than this in total, unless the item has its own alert level
+const lowAt = (item) => (item.min_qty > 0 ? `${nf(item.min_qty)} or less` : `under ${LOW_DEFAULT}`);
+const isLow = (item, list) => seesAll(list) && (item.min_qty > 0
+  ? totalQty(item, list) <= item.min_qty : totalQty(item, list) < LOW_DEFAULT);
 const nf = (n) => Number(n).toLocaleString();
 const plural = (n, word) => `${nf(n)} ${word}${n === 1 ? "" : "s"}`;
 
@@ -59,6 +63,7 @@ function stockMarkup(readOnly) {
           <input id="stock-search" type="search" placeholder="Search items…" aria-label="Search items" autocomplete="off">
         </div>
         <div class="seg" id="cat-tabs" role="tablist" aria-label="Type"></div>
+        <button type="button" class="btn low-filter" id="low-filter" data-action="stock-low" aria-pressed="false" hidden></button>
       </div>
       <p class="muted small" id="stock-info"></p>
       <div class="stock-grid" id="stock-grid"></div>
@@ -98,7 +103,7 @@ function stockMarkup(readOnly) {
       </fieldset>
       <label>Low stock alert at <span class="muted">(optional)</span>
         <input name="min_qty" type="number" min="0" max="1000000" inputmode="numeric" placeholder="e.g. 20">
-        <span class="muted small hint">The item is flagged when the total reaches this number or less.</span>
+        <span class="muted small hint">Flagged as running low at this total or less. Leave empty to flag it under 50.</span>
       </label>
       <label>Notes <span class="muted">(optional)</span><textarea name="notes" rows="2" maxlength="1000"
         placeholder="Size, color, supplier, campaign…"></textarea></label>
@@ -130,8 +135,9 @@ function stockMarkup(readOnly) {
       <p class="muted small upload-intro"></p>
       <ul class="upload-sheets"></ul>
       <p class="muted small">Items are matched by their code, so uploading an updated file later changes the
-        quantities instead of adding the items again. Each quantity replaces what that location had, and every
-        change is kept in the item's history. Items not in the file aren't touched.</p>
+        quantities instead of adding the items again. If the same item is in more than one sheet going to the same
+        location, the quantities are added together. Each total replaces what that location had, and every change is
+        kept in the item's history. Items not in the file aren't touched.</p>
       <div class="dialog-actions">
         <button type="button" class="btn ghost" data-action="close-dialog">Cancel</button>
         <button type="submit" class="btn primary">Upload</button>
@@ -246,6 +252,14 @@ function renderStock() {
     <button type="button" role="tab" aria-selected="${stock.cat === v}" class="${stock.cat === v ? "active" : ""}"
       data-action="stock-cat" data-cat="${v}">${label}</button>`).join("");
 
+  const lowBtn = $("#low-filter");
+  lowBtn.hidden = !seesAll(list);
+  if (!seesAll(list)) stock.lowOnly = false;
+  lowBtn.textContent = `⚠ Running low${lowCount ? ` (${lowCount})` : ""}`;
+  lowBtn.classList.toggle("active", stock.lowOnly);
+  lowBtn.setAttribute("aria-pressed", String(stock.lowOnly));
+  lowBtn.title = `Items with fewer than ${LOW_DEFAULT} in total (or at their own alert level)`;
+
   renderStockGrid();
 }
 
@@ -259,7 +273,8 @@ function filteredItems(list) {
   let hiddenEmpty = 0;
   const items = list.items.filter((it) => {
     if (stock.cat !== "all" && it.category !== stock.cat) return false;
-    if (terms.length && !terms.every((t) => norm(`${it.name} ${it.code || ""} ${it.notes} ${CAT_LABEL[it.category]}`).includes(t))) return false;
+    if (stock.lowOnly && !isLow(it, list)) return false;
+    if (terms.length && !terms.every((t) => norm(`${it.name} ${it.code || ""} ${it.notes} ${CAT_LABEL[it.category]} ${isLow(it, list) ? "running low stock" : ""}`).includes(t))) return false;
     if (stock.loc !== "all" && !stock.showEmpty && qtyAt(it, stock.loc) === 0) { hiddenEmpty++; return false; }
     return true;
   });
@@ -286,7 +301,7 @@ function itemCard(it, list) {
         <span class="cat ${it.category}">${CAT_LABEL[it.category]}</span>
       </div>
       <div class="item-total"><strong>${nf(shownQty)}</strong> ${here ? `at ${esc(here.name)}` : "in stock"}
-        ${low ? `<span class="low-badge" title="Alert set at ${nf(it.min_qty)}">Low stock</span>` : ""}</div>
+        ${low ? `<span class="low-badge" title="Running low: ${lowAt(it)}">Running low</span>` : ""}</div>
       ${it.code ? `<p class="item-code small muted">${esc(it.code)}</p>` : ""}
       ${locs}
       ${it.notes ? `<p class="item-notes small">${esc(it.notes)}</p>` : ""}
@@ -307,7 +322,7 @@ function renderStockGrid() {
     <button type="button" class="linkish" data-action="stock-show-empty">Show ${hiddenEmpty === 1 ? "it" : "them"}</button>`);
   else if (stock.loc !== "all" && stock.showEmpty) info.push(`<button type="button" class="linkish" data-action="stock-show-empty">Hide items with none here</button>`);
   $("#stock-info").innerHTML = info.join(" ");
-  let empty = "No items match.";
+  let empty = stock.lowOnly && !stock.query ? "Nothing is running low." : "No items match.";
   if (!list.items.length) {
     empty = canEditList(list) ? "No items yet. Click “+ Add item” to add the first gift or giveaway with its photo."
       : "No items yet.";
@@ -480,11 +495,15 @@ async function startUpload(file) {
   const list = curList();
   const form = $("#upload-dialog form");
   $(".form-error", form)?.remove();
+  // Every sheet goes into HQ Store unless changed here; sheets that share an item add up.
+  const hq = list.locations.find((l) => norm(l.name).replace(/\s+/g, " ").trim() === "hq store");
   $(".upload-intro", form).textContent =
-    `${file.name}: choose where each sheet's quantities go. Nothing is saved until you click Upload.`;
+    `${file.name}: everything goes into ${hq ? hq.name : "a new HQ Store location"} unless you change it below. ` +
+    "Nothing is saved until you click Upload.";
   $(".upload-sheets", form).innerHTML = sheets.map((s) => {
-    const options = list.locations.map((l) =>
-      `<option value="${l.id}" ${s.suggested_location_id === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+    const options = (hq ? "" : `<option value="new-hq" selected>New location: HQ Store</option>`) +
+      list.locations.map((l) =>
+        `<option value="${l.id}" ${hq && hq.id === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
     const sample = s.sample.map((r) => `${esc(r.name)}${r.code ? ` <span class="muted">(${esc(r.code)})</span>` : ""}: ${nf(r.qty)}`).join(" · ");
     return `
     <li class="upload-sheet">
@@ -496,7 +515,7 @@ async function startUpload(file) {
       <label>Goes into
         <select name="sheet_${s.index}" data-sheet="${s.index}">
           ${options}
-          <option value="new" ${s.suggested_location_id ? "" : "selected"}>New location: ${esc(s.name)}</option>
+          <option value="new">New location: ${esc(s.name)}</option>
           <option value="skip">Don't upload this sheet</option>
         </select>
       </label>
@@ -513,8 +532,9 @@ async function finishUpload(form) {
   for (const sel of $$("select[data-sheet]", form)) {
     const sheet = up.sheets.find((s) => s.index === Number(sel.dataset.sheet));
     if (sel.value === "skip") continue;
-    choices.push(sel.value === "new" ? { index: sheet.index, new_location: sheet.name }
-      : { index: sheet.index, location_id: Number(sel.value) });
+    if (sel.value === "new") choices.push({ index: sheet.index, new_location: sheet.name });
+    else if (sel.value === "new-hq") choices.push({ index: sheet.index, new_location: "HQ Store" });
+    else choices.push({ index: sheet.index, location_id: Number(sel.value) });
   }
   if (!choices.length) throw new Error("Choose at least one sheet to upload.");
   const r = await api("POST", "/api/stock/import", { file: up.file, filename: up.filename, sheets: choices });
@@ -555,6 +575,7 @@ app.addEventListener("click", async (e) => {
       case "stock-list": stock.listIdx = Number(el.dataset.idx); stock.loc = "all"; renderStock(); break;
       case "stock-loc": stock.loc = el.dataset.loc; stock.showEmpty = false; renderStock(); break;
       case "stock-cat": stock.cat = el.dataset.cat; renderStock(); break;
+      case "stock-low": stock.lowOnly = !stock.lowOnly; renderStock(); break;
       case "stock-show-empty": stock.showEmpty = !stock.showEmpty; renderStockGrid(); break;
       case "stock-add": openItem(null); break;
       case "stock-edit": if (item) openItem(item); break;

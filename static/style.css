@@ -530,3 +530,5 @@ button, a, summary, label, input, select, textarea { touch-action: manipulation;
 .upload-sheet { border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: grid; gap: 8px; }
 .upload-sheet-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; }
 .upload-sample { margin: 0; overflow-wrap: anywhere; }
+.low-filter { white-space: nowrap; }
+.low-filter.active { background: var(--zain-magenta); border-color: var(--zain-magenta); color: #fff; }
