@@ -440,6 +440,21 @@ function openLocations() {
   if (!$("#locations-dialog").open) $("#locations-dialog").showModal();
 }
 
+function showMovePanel(li, loc, pieces) {
+  if ($(".loc-move", li)) return;
+  const others = curList().locations.filter((l) => l.id !== loc.id);
+  if (!others.length) { toast(`${loc.name} still has stock and there's nowhere else to move it.`, true); return; }
+  const hq = others.find((l) => norm(l.name).replace(/\s+/g, " ").trim() === "hq store") || others[0];
+  li.insertAdjacentHTML("beforeend", `
+    <div class="loc-move">
+      <span class="small">${esc(loc.name)} has ${nf(pieces)} pieces. Move them into</span>
+      <select aria-label="Move stock into">${others.map((l) =>
+        `<option value="${l.id}" ${l.id === hq.id ? "selected" : ""}>${esc(l.name)}</option>`).join("")}</select>
+      <button type="button" class="btn small danger" data-action="stock-move-loc">Move &amp; delete</button>
+      <button type="button" class="btn ghost small" data-action="stock-move-cancel">Cancel</button>
+    </div>`);
+}
+
 async function saveLocations(form) {
   const list = curList();
   for (const l of list.locations) {
@@ -496,14 +511,14 @@ async function startUpload(file) {
   const form = $("#upload-dialog form");
   $(".form-error", form)?.remove();
   // Every sheet goes into HQ Store unless changed here; sheets that share an item add up.
-  const hq = list.locations.find((l) => norm(l.name).replace(/\s+/g, " ").trim() === "hq store");
+  // Uploads only fill existing locations; new ones are added in "Locations & people".
+  if (!list.locations.length) throw new Error("Add a location in “Locations & people” first.");
+  const hq = list.locations.find((l) => norm(l.name).replace(/\s+/g, " ").trim() === "hq store") || list.locations[0];
   $(".upload-intro", form).textContent =
-    `${file.name}: everything goes into ${hq ? hq.name : "a new HQ Store location"} unless you change it below. ` +
-    "Nothing is saved until you click Upload.";
+    `${file.name}: everything goes into ${hq.name} unless you change it below. Nothing is saved until you click Upload.`;
   $(".upload-sheets", form).innerHTML = sheets.map((s) => {
-    const options = (hq ? "" : `<option value="new-hq" selected>New location: HQ Store</option>`) +
-      list.locations.map((l) =>
-        `<option value="${l.id}" ${hq && hq.id === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
+    const options = list.locations.map((l) =>
+      `<option value="${l.id}" ${hq.id === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("");
     const sample = s.sample.map((r) => `${esc(r.name)}${r.code ? ` <span class="muted">(${esc(r.code)})</span>` : ""}: ${nf(r.qty)}`).join(" · ");
     return `
     <li class="upload-sheet">
@@ -515,7 +530,6 @@ async function startUpload(file) {
       <label>Goes into
         <select name="sheet_${s.index}" data-sheet="${s.index}">
           ${options}
-          <option value="new">New location: ${esc(s.name)}</option>
           <option value="skip">Don't upload this sheet</option>
         </select>
       </label>
@@ -532,16 +546,13 @@ async function finishUpload(form) {
   for (const sel of $$("select[data-sheet]", form)) {
     const sheet = up.sheets.find((s) => s.index === Number(sel.dataset.sheet));
     if (sel.value === "skip") continue;
-    if (sel.value === "new") choices.push({ index: sheet.index, new_location: sheet.name });
-    else if (sel.value === "new-hq") choices.push({ index: sheet.index, new_location: "HQ Store" });
-    else choices.push({ index: sheet.index, location_id: Number(sel.value) });
+    choices.push({ index: sheet.index, location_id: Number(sel.value) });
   }
   if (!choices.length) throw new Error("Choose at least one sheet to upload.");
   const r = await api("POST", "/api/stock/import", { file: up.file, filename: up.filename, sheets: choices });
   stock.upload = null;
   $("#upload-dialog").close();
   const parts = [`${plural(r.created, "new item")}`, `${plural(r.updated, "item")} updated`];
-  if (r.new_locations) parts.push(`${plural(r.new_locations, "new location")}`);
   toast(`Uploaded: ${parts.join(", ")}`);
 }
 
@@ -614,12 +625,29 @@ app.addEventListener("click", async (e) => {
       case "stock-delete-loc": {
         const locId = Number(el.closest("[data-loc-id]").dataset.locId);
         const loc = list.locations.find((l) => l.id === locId);
+        const pieces = list.items.reduce((n, it) => n + qtyAt(it, locId), 0);
+        if (loc && pieces > 0) { showMovePanel(el.closest("[data-loc-id]"), loc, pieces); break; }
         if (loc && confirm(`Delete the location "${loc.name}"?`)) {
           await api("DELETE", `/api/stock/locations/${locId}`);
           toast(`${loc.name} deleted`);
           await refreshStock();
           openLocations();
         }
+        break;
+      }
+      case "stock-move-cancel": el.closest(".loc-move").remove(); break;
+      case "stock-move-loc": {
+        const li = el.closest("[data-loc-id]");
+        const loc = list.locations.find((l) => l.id === Number(li.dataset.locId));
+        const into = list.locations.find((l) => l.id === Number($(".loc-move select", li).value));
+        if (!loc || !into) return;
+        if (!confirm(`Move everything in "${loc.name}" into "${into.name}" and delete "${loc.name}"?\n\n` +
+                     "Quantities are added to what's already there. This can't be undone.")) return;
+        const r = await api("POST", `/api/stock/locations/${loc.id}/move`, { into: into.id });
+        toast(`Moved ${nf(r.moved_qty)} pieces (${plural(r.moved_items, "item")}) into ${r.into}. ${loc.name} deleted.`);
+        if (stock.loc === String(loc.id)) stock.loc = "all";
+        await refreshStock();
+        openLocations();
         break;
       }
       case "stock-share": renderShare(); $("#share-dialog").showModal(); break;

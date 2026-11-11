@@ -1093,9 +1093,36 @@ def api_stock_location_update(h, conn, location_id):
 def api_stock_location_delete(h, conn, location_id):
     loc = owned_location(conn, h.current_user(conn), location_id)
     if conn.execute("SELECT 1 FROM stock_levels WHERE location_id = ? AND qty > 0", (loc["id"],)).fetchone():
-        raise ApiError(409, f"{loc['name']} still has stock. Set its quantities to 0 first, or rename it instead.")
+        raise ApiError(409, f"{loc['name']} still has stock. Move it into another location first.")
     conn.execute("DELETE FROM stock_locations WHERE id = ?", (loc["id"],))
     return 200, {"ok": True}
+
+
+def api_stock_location_move(h, conn, location_id):
+    """Add every quantity in this location to another of the owner's locations, then delete it."""
+    user = h.current_user(conn)
+    loc = owned_location(conn, user, location_id)
+    data = h.read_json()
+    try:
+        target = owned_location(conn, user, int(data.get("into")))
+    except (TypeError, ValueError):
+        raise ApiError(400, "Choose where the stock should go.")
+    if target["id"] == loc["id"]:
+        raise ApiError(400, "Choose a different location to move the stock into.")
+    all_ids = {r["id"] for r in conn.execute("SELECT id FROM stock_locations WHERE owner_id = ?", (user["id"],))}
+    moved_items = moved_qty = 0
+    for r in conn.execute("SELECT item_id, qty FROM stock_levels WHERE location_id = ? AND qty > 0",
+                          (loc["id"],)).fetchall():
+        have = conn.execute("SELECT qty FROM stock_levels WHERE item_id = ? AND location_id = ?",
+                            (r["item_id"], target["id"])).fetchone()
+        total = (have["qty"] if have else 0) + r["qty"]
+        if total > MAX_QTY:
+            raise ApiError(400, "That would put more than 1,000,000 of one item in a location.")
+        save_levels(conn, user, r["item_id"], all_ids, {str(target["id"]): total})
+        moved_items += 1
+        moved_qty += r["qty"]
+    conn.execute("DELETE FROM stock_locations WHERE id = ?", (loc["id"],))
+    return 200, {"moved_items": moved_items, "moved_qty": moved_qty, "into": target["name"]}
 
 
 def decode_photo(value):
@@ -1460,37 +1487,24 @@ def api_stock_import(h, conn):
             "suggested_location_id": suggest_location(s["name"], locations),
         } for s in sheets]}
 
-    # Apply: each chosen sheet goes into an existing location or a new one.
+    # Apply: each chosen sheet goes into one of the owner's existing locations.
     choices = data["sheets"]
     if not isinstance(choices, list):
         raise ApiError(400, "Choose a location for each sheet.")
     loc_ids = {l["id"] for l in locations}
     by_index = {s["index"]: s for s in sheets}
-    plan, new_locations = [], 0
+    plan = []
     for choice in choices:
         sheet = by_index.get(choice.get("index") if isinstance(choice, dict) else None)
         if not sheet:
             raise ApiError(400, "That sheet isn't in the file.")
-        if choice.get("new_location"):
-            name = text(choice, "new_location", max_len=80)
-            existing = next((l["id"] for l in locations if name_key(l["name"]) == name_key(name)), None)
-            if existing:
-                loc_id = existing
-            else:
-                sort = conn.execute("SELECT COALESCE(MAX(sort), -1) + 1 FROM stock_locations WHERE owner_id = ?",
-                                    (owner["id"],)).fetchone()[0]
-                loc_id = conn.execute("INSERT INTO stock_locations (owner_id, name, sort, created_at) VALUES (?, ?, ?, ?)",
-                                      (owner["id"], name, sort, now_iso())).lastrowid
-                locations.append({"id": loc_id, "name": name})
-                loc_ids.add(loc_id)
-                new_locations += 1
-        else:
-            try:
-                loc_id = int(choice.get("location_id"))
-            except (TypeError, ValueError):
-                raise ApiError(400, f"Choose a location for “{sheet['name']}”.")
-            if loc_id not in loc_ids:
-                raise ApiError(404, "Location not found.")
+        # Uploads only fill existing locations; new ones are added in "Locations & people".
+        try:
+            loc_id = int(choice.get("location_id"))
+        except (TypeError, ValueError):
+            raise ApiError(400, f"Choose a location for “{sheet['name']}”.")
+        if loc_id not in loc_ids:
+            raise ApiError(404, "Location not found.")
         plan.append((sheet, loc_id))
     if not plan:
         raise ApiError(400, "Choose at least one sheet to upload.")
@@ -1519,8 +1533,7 @@ def api_stock_import(h, conn):
     for item_id, qty in levels.items():
         save_levels(conn, owner, item_id, loc_ids, {str(l): n for l, n in qty.items()})
     changed = conn.execute("SELECT COUNT(*) FROM stock_history").fetchone()[0] - before
-    return 200, {"created": created, "updated": len(levels) - created, "quantities_changed": changed,
-                 "new_locations": new_locations}
+    return 200, {"created": created, "updated": len(levels) - created, "quantities_changed": changed}
 
 
 def api_stock_share(h, conn):
@@ -1575,6 +1588,7 @@ ROUTES = [
     ("POST", r"/api/stock/locations", api_stock_location_create),
     ("PATCH", r"/api/stock/locations/(\d+)", api_stock_location_update),
     ("DELETE", r"/api/stock/locations/(\d+)", api_stock_location_delete),
+    ("POST", r"/api/stock/locations/(\d+)/move", api_stock_location_move),
     ("POST", r"/api/stock/items", api_stock_item_create),
     ("PATCH", r"/api/stock/items/(\d+)", api_stock_item_update),
     ("DELETE", r"/api/stock/items/(\d+)", api_stock_item_delete),
