@@ -443,15 +443,22 @@ function openLocations() {
 function showMovePanel(li, loc, pieces) {
   if ($(".loc-move", li)) return;
   const others = curList().locations.filter((l) => l.id !== loc.id);
-  if (!others.length) { toast(`${loc.name} still has stock and there's nowhere else to move it.`, true); return; }
   const hq = others.find((l) => norm(l.name).replace(/\s+/g, " ").trim() === "hq store") || others[0];
   li.insertAdjacentHTML("beforeend", `
     <div class="loc-move">
-      <span class="small">${esc(loc.name)} has ${nf(pieces)} pieces. Move them into</span>
-      <select aria-label="Move stock into">${others.map((l) =>
-        `<option value="${l.id}" ${l.id === hq.id ? "selected" : ""}>${esc(l.name)}</option>`).join("")}</select>
-      <button type="button" class="btn small danger" data-action="stock-move-loc">Move &amp; delete</button>
-      <button type="button" class="btn ghost small" data-action="stock-move-cancel">Cancel</button>
+      <p class="small loc-move-title"><strong>${esc(loc.name)}</strong> has ${nf(pieces)} pieces.</p>
+      ${others.length ? `
+      <div class="loc-move-row">
+        <span class="small">Move them into</span>
+        <select aria-label="Move stock into">${others.map((l) =>
+          `<option value="${l.id}" ${l.id === hq.id ? "selected" : ""}>${esc(l.name)}</option>`).join("")}</select>
+        <button type="button" class="btn small" data-action="stock-move-loc">Move &amp; delete</button>
+      </div>
+      <span class="muted small">or</span>` : ""}
+      <div class="loc-move-row">
+        <button type="button" class="btn small danger" data-action="stock-remove-loc">Delete with everything in it</button>
+        <button type="button" class="btn ghost small" data-action="stock-move-cancel">Cancel</button>
+      </div>
     </div>`);
 }
 
@@ -636,6 +643,24 @@ app.addEventListener("click", async (e) => {
         break;
       }
       case "stock-move-cancel": el.closest(".loc-move").remove(); break;
+      case "stock-remove-loc": {
+        const loc = list.locations.find((l) => l.id === Number(el.closest("[data-loc-id]").dataset.locId));
+        if (!loc) return;
+        const here = list.items.filter((it) => qtyAt(it, loc.id) > 0);
+        const onlyHere = here.filter((it) => list.locations.every((l) => l.id === loc.id || qtyAt(it, l.id) === 0));
+        const pieces = here.reduce((n, it) => n + qtyAt(it, loc.id), 0);
+        const shared = here.length - onlyHere.length;
+        let msg = `Delete "${loc.name}" and its ${nf(pieces)} pieces?\n\n`;
+        if (onlyHere.length) msg += `${plural(onlyHere.length, "item")} only stocked here will be deleted completely, with ${onlyHere.length === 1 ? "its photo" : "their photos"} and history.\n`;
+        if (shared) msg += `${plural(shared, "item")} also in other locations will keep those quantities.\n`;
+        if (!confirm(`${msg}\nThis can't be undone.`)) return;
+        const r = await api("POST", `/api/stock/locations/${loc.id}/remove`, {});
+        toast(`${r.name} deleted${r.deleted_items ? ` with ${plural(r.deleted_items, "item")}` : ""}`);
+        if (stock.loc === String(loc.id)) stock.loc = "all";
+        await refreshStock();
+        openLocations();
+        break;
+      }
       case "stock-move-loc": {
         const li = el.closest("[data-loc-id]");
         const loc = list.locations.find((l) => l.id === Number(li.dataset.locId));

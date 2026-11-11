@@ -532,6 +532,7 @@ button, a, summary, label, input, select, textarea { touch-action: manipulation;
 .upload-sample { margin: 0; overflow-wrap: anywhere; }
 .low-filter { white-space: nowrap; }
 .low-filter.active { background: var(--zain-magenta); border-color: var(--zain-magenta); color: #fff; }
-.loc-move { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; padding: 10px;
-  border: 1px dashed var(--bad); border-radius: 10px; }
+.loc-move { display: grid; gap: 8px; margin-top: 8px; padding: 10px; border: 1px dashed var(--bad); border-radius: 10px; }
+.loc-move-title { margin: 0; }
+.loc-move-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .loc-move select { width: auto; min-width: 140px; }

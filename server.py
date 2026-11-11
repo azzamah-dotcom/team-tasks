@@ -1098,6 +1098,21 @@ def api_stock_location_delete(h, conn, location_id):
     return 200, {"ok": True}
 
 
+def api_stock_location_remove(h, conn, location_id):
+    """Delete a location with everything in it: its quantities, and items that were only stocked there."""
+    loc = owned_location(conn, h.current_user(conn), location_id)
+    only_here = [r["id"] for r in conn.execute("""
+        SELECT i.id FROM stock_items i JOIN stock_levels s ON s.item_id = i.id
+        WHERE i.owner_id = ? AND s.location_id = ? AND s.qty > 0
+          AND NOT EXISTS (SELECT 1 FROM stock_levels o WHERE o.item_id = i.id AND o.location_id != ? AND o.qty > 0)
+    """, (loc["owner_id"], loc["id"], loc["id"]))]
+    pieces = conn.execute("SELECT COALESCE(SUM(qty), 0) FROM stock_levels WHERE location_id = ?",
+                          (loc["id"],)).fetchone()[0]
+    conn.executemany("DELETE FROM stock_items WHERE id = ?", [(i,) for i in only_here])
+    conn.execute("DELETE FROM stock_locations WHERE id = ?", (loc["id"],))  # its quantities go with it
+    return 200, {"deleted_items": len(only_here), "deleted_qty": pieces, "name": loc["name"]}
+
+
 def api_stock_location_move(h, conn, location_id):
     """Add every quantity in this location to another of the owner's locations, then delete it."""
     user = h.current_user(conn)
@@ -1589,6 +1604,7 @@ ROUTES = [
     ("PATCH", r"/api/stock/locations/(\d+)", api_stock_location_update),
     ("DELETE", r"/api/stock/locations/(\d+)", api_stock_location_delete),
     ("POST", r"/api/stock/locations/(\d+)/move", api_stock_location_move),
+    ("POST", r"/api/stock/locations/(\d+)/remove", api_stock_location_remove),
     ("POST", r"/api/stock/items", api_stock_item_create),
     ("PATCH", r"/api/stock/items/(\d+)", api_stock_item_update),
     ("DELETE", r"/api/stock/items/(\d+)", api_stock_item_delete),
